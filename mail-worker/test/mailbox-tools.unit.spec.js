@@ -1,10 +1,100 @@
-import { describe, expect, it } from 'vitest';
-import { extractVerificationCode, MAILBOX_LAST_USED_TOUCH_SQL } from '../src/service/mailbox-tools-service';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import mailboxToolsService, { extractVerificationCode, MAILBOX_LAST_USED_TOUCH_SQL } from '../src/service/mailbox-tools-service';
 import { isMailboxCodeCredential, isPublicMailboxCodeRequest } from '../src/security/mailbox-code-route';
 import { ensureMailboxToolsSchema, MAILBOX_TOOLS_SCHEMA_STATEMENTS } from '../src/init/mailbox-tools-schema';
 import { toPublicCodeResult } from '../src/api/mailbox-tools-api';
+import accountService from '../src/service/account-service';
+import roleService from '../src/service/role-service';
+import settingService from '../src/service/setting-service';
+import userService from '../src/service/user-service';
 
 const credential = '123e4567-e89b-42d3-a456-426614174000.ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq';
+
+afterEach(() => vi.restoreAllMocks());
+
+describe('batch mailbox retrieval credentials', () => {
+	it('atomically creates one independent signed code URL for every new mailbox', async () => {
+		vi.spyOn(userService, 'selectById').mockResolvedValue({ email: 'admin@salvadawn.com', type: 1 });
+		vi.spyOn(settingService, 'query').mockResolvedValue({ minEmailPrefix: 1, emailPrefixFilter: [] });
+		vi.spyOn(roleService, 'selectById').mockResolvedValue({});
+		vi.spyOn(accountService, 'countUserAccount')
+			.mockResolvedValueOnce(1)
+			.mockResolvedValueOnce(3);
+
+		const batches = [];
+		const db = {
+			prepare(sql) {
+				return {
+					sql,
+					bindings: [],
+					bind(...bindings) {
+						this.bindings = bindings;
+						return this;
+					},
+					async first() {
+						return { total: 0 };
+					}
+				};
+			},
+			async batch(statements) {
+				batches.push(statements);
+				const accountStatement = statements.find(statement => /WITH candidates\(email, name\)/i.test(statement.sql));
+				const tokenStatement = statements.find(statement => /WITH candidates\(public_id, email\)/i.test(statement.sql));
+				const accountValues = accountStatement.bindings.slice(0, -1);
+				const accounts = [];
+				for (let index = 0; index < accountValues.length; index += 2) {
+					accounts.push({
+						accountId: 900 + accounts.length,
+						email: accountValues[index],
+						createdAt: '2026-08-17 00:00:00'
+					});
+				}
+				const tokenValues = tokenStatement.bindings.slice(0, accounts.length * 2);
+				const tokens = accounts.map((accountRow, index) => ({
+					id: 1200 + index,
+					publicId: tokenValues[index * 2],
+					accountId: accountRow.accountId,
+					label: 'batch-created',
+					createdAt: '2026-08-17 00:00:00',
+					lastUsedAt: null
+				}));
+				return statements.map(statement => {
+					if (statement === accountStatement) return { results: accounts };
+					if (statement === tokenStatement) return { results: tokens };
+					return { results: [] };
+				});
+			}
+		};
+		const context = {
+			env: {
+				db,
+				domain: ['salvadawn.com'],
+				admin: 'admin@salvadawn.com',
+				jwt_secret: 'unit-test-secret'
+			},
+			req: { url: 'https://mail.salvadawn.com/api/mailbox-tools/batch-create' }
+		};
+
+		const result = await mailboxToolsService.batchCreate(context, {
+			count: 2,
+			length: 8,
+			domain: 'salvadawn.com',
+			prefix: 'verify-'
+		}, 7);
+
+		expect(result.created).toHaveLength(2);
+		expect(new Set(result.created.map(item => item.token)).size).toBe(2);
+		for (const item of result.created) {
+			expect(isMailboxCodeCredential(item.token)).toBe(true);
+			expect(item.codeUrl).toBe(`https://mail.salvadawn.com/api/mailbox-tools/code/${item.token}`);
+			expect(item.tokenId).toBeGreaterThan(0);
+		}
+		expect(batches).toHaveLength(1);
+		expect(batches[0]).toHaveLength(4);
+		expect(batches[0][0].sql).toMatch(/COUNT\(\*\).*mailbox_api_token/is);
+		expect(batches[0].at(-1).sql).toMatch(/public_id IN/is);
+	});
+});
 
 describe('verification-code extraction', () => {
 	it('prefers the code stored by the mail ingestion pipeline', () => {

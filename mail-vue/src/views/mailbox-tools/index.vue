@@ -190,10 +190,32 @@
                 <code class="account-id-cell">{{ scope.row.accountId || '—' }}</code>
               </template>
             </el-table-column>
-            <el-table-column :label="$t('operation')" width="215" align="right">
+            <el-table-column prop="url" :label="$t('retrievalUrl')" min-width="390">
+              <template #default="scope">
+                <button
+                    v-if="scope.row.url"
+                    class="url-value batch-url-value"
+                    type="button"
+                    :title="scope.row.url"
+                    @click="copyText(scope.row.url)"
+                >
+                  <code>{{ scope.row.url }}</code>
+                  <Icon icon="fluent-color:clipboard-24" width="17" height="17"/>
+                </button>
+                <span v-else class="url-unavailable">{{ $t('urlUnavailable') }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column :label="$t('operation')" width="225" align="right">
               <template #default="scope">
                 <el-button link type="primary" @click="copyText(scope.row.email)">{{ $t('copy') }}</el-button>
                 <el-button
+                    v-if="scope.row.url"
+                    link
+                    type="primary"
+                    @click="copyText(scope.row.url)"
+                >{{ $t('copyUrl') }}</el-button>
+                <el-button
+                    v-else
                     link
                     type="primary"
                     :disabled="!scope.row.accountId"
@@ -466,6 +488,7 @@ async function createBatch() {
     accountStore.refreshAccountList()
     ElMessage({message: t('batchCreateSuccess', {count: batchRows.value.length}), type: 'success', plain: true})
     await loadAccounts()
+    await refreshTokens()
   } finally {
     batchLoading.value = false
   }
@@ -478,13 +501,16 @@ function normalizeMailboxRows(data) {
 
   return source.map((item, index) => {
     if (typeof item === 'string') {
-      return {rowKey: `${item}-${index}`, email: item, accountId: null}
+      return {rowKey: `${item}-${index}`, email: item, accountId: null, token: '', url: ''}
     }
+    const token = String(item.token || item.credential || item.accessToken || item.secret || '')
     return {
       ...item,
       rowKey: item.accountId || item.userId || `${item.email}-${index}`,
       accountId: Number(item.accountId) || null,
-      email: item.email || item.address || item.mailbox || ''
+      email: item.email || item.address || item.mailbox || '',
+      token,
+      url: item.codeUrl || item.url || item.retrievalUrl || item.fetchUrl || buildFallbackUrl(token)
     }
   }).filter(item => item.email)
 }
@@ -677,7 +703,9 @@ async function copyText(value) {
 }
 
 function copyBatchRows() {
-  return copyText(batchRows.value.map(row => row.email).join('\n'))
+  return copyText(batchRows.value
+      .map(row => row.url ? `${row.email}\t${row.url}` : row.email)
+      .join('\n'))
 }
 
 function csvCell(value) {
@@ -686,8 +714,8 @@ function csvCell(value) {
 
 function downloadCsv() {
   const lines = [
-    ['email', 'accountId'],
-    ...batchRows.value.map(row => [row.email, row.accountId || ''])
+    ['email', 'accountId', 'retrievalUrl'],
+    ...batchRows.value.map(row => [row.email, row.accountId || '', row.url || ''])
   ].map(row => row.map(csvCell).join(','))
 
   const blob = new Blob([`\uFEFF${lines.join('\r\n')}`], {type: 'text/csv;charset=utf-8'})

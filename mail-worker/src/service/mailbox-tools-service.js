@@ -16,8 +16,13 @@ const encoder = new TextEncoder();
 const MAX_BATCH_SIZE = 50;
 const MAX_MAILBOXES_PER_USER = 500;
 const MAX_RANDOM_LENGTH = 32;
-const MAX_ACTIVE_TOKENS_PER_USER = 100;
 const MAX_ACTIVE_TOKENS_PER_ACCOUNT = 10;
+// Every mailbox created by the automation pool owns one retrieval URL. Keep
+// enough user-level capacity for all 500 mailboxes while retaining the
+// existing per-mailbox limit for manually-created replacement URLs.
+const MAX_ACTIVE_TOKENS_PER_USER = MAX_MAILBOXES_PER_USER * MAX_ACTIVE_TOKENS_PER_ACCOUNT;
+const BATCH_SQL_CHUNK_SIZE = 25;
+const AUTO_TOKEN_LABEL = 'batch-created';
 const TOKEN_PURPOSE = 'cloud-mail:mailbox-api:v1:';
 const RANDOM_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
 
@@ -120,6 +125,52 @@ function randomString(length) {
 
 function isUniqueConstraint(error) {
 	return /unique constraint|constraint failed|sqlite_constraint/i.test(error?.message || '');
+}
+
+function isQuotaGuardConstraint(error) {
+	return /not null constraint failed:\s*account\.email|sqlite_constraint_notnull/i.test(error?.message || '');
+}
+
+function chunks(items, size = BATCH_SQL_CHUNK_SIZE) {
+	const output = [];
+	for (let index = 0; index < items.length; index += size) {
+		output.push(items.slice(index, index + size));
+	}
+	return output;
+}
+
+function valuesPlaceholders(rowCount, columnCount) {
+	const row = `(${Array(columnCount).fill('?').join(', ')})`;
+	return Array(rowCount).fill(row).join(', ');
+}
+
+async function countActiveUserTokens(c, userId) {
+	const row = await c.env.db
+		.prepare(`
+			SELECT COUNT(*) AS total
+			FROM mailbox_api_token
+			WHERE user_id = ? AND revoked_at IS NULL
+		`)
+		.bind(userId)
+		.first();
+	return Number(row?.total || 0);
+}
+
+async function removeIncompleteBatch(c, userId, accountIds) {
+	if (!accountIds.length) return;
+	for (const idChunk of chunks(accountIds, 50)) {
+		const placeholders = idChunk.map(() => '?').join(', ');
+		await c.env.db.batch([
+			c.env.db.prepare(`
+				DELETE FROM mailbox_api_token
+				WHERE user_id = ? AND account_id IN (${placeholders})
+			`).bind(userId, ...idChunk),
+			c.env.db.prepare(`
+				DELETE FROM account
+				WHERE user_id = ? AND account_id IN (${placeholders})
+			`).bind(userId, ...idChunk)
+		]);
+	}
 }
 
 function retrievalOrigin(c) {
@@ -230,14 +281,23 @@ const mailboxToolsService = {
 		// This automation pool intentionally has its own quota. The ordinary
 		// role.accountCount value is designed for interactive account creation
 		// and would make a default batch of ten fail for a user with one mailbox.
-		const currentCount = await accountService.countUserAccount(c, userId);
+		const [currentCount, activeTokenCount] = await Promise.all([
+			accountService.countUserAccount(c, userId),
+			countActiveUserTokens(c, userId)
+		]);
 		const remainingBeforeCreate = Math.max(0, MAX_MAILBOXES_PER_USER - currentCount);
 		if (countRequested > remainingBeforeCreate) {
-			throw new BizError(`批量邮箱总上限为 ${MAX_MAILBOXES_PER_USER} 个，当前还可创建 ${remainingBeforeCreate} 个`, 403);
+			throw new BizError(`批量邮箱上限为 ${MAX_MAILBOXES_PER_USER} 个，当前仅可创建 ${remainingBeforeCreate} 个`, 403);
+		}
+		const remainingTokenCapacity = Math.max(0, MAX_ACTIVE_TOKENS_PER_USER - activeTokenCount);
+		if (countRequested > remainingTokenCapacity) {
+			throw new BizError(`取件 URL 上限为 ${MAX_ACTIVE_TOKENS_PER_USER} 个，当前仅可创建 ${remainingTokenCapacity} 个`, 403);
 		}
 
-		// A D1 batch is transactional. In the extremely unlikely event of a
-		// random-address collision, the whole batch rolls back and is regenerated.
+		// D1 executes every statement in a batch as one transaction. Accounts,
+		// their public IDs and the final cardinality assertion therefore commit
+		// together. A quota race, address collision or token collision aborts the
+		// whole batch rather than leaving mailboxes without retrieval URLs.
 		for (let batchAttempt = 0; batchAttempt < 6; batchAttempt++) {
 			const candidates = [];
 			const candidateSet = new Set();
@@ -255,30 +315,142 @@ const mailboxToolsService = {
 				throw new BizError('无法生成符合前缀过滤规则的随机邮箱', 409);
 			}
 
-			const statements = candidates.map(item =>
-				c.env.db
-					.prepare(`
-						INSERT INTO account (email, name, user_id)
-						SELECT ?, ?, ?
-						WHERE (SELECT COUNT(*) FROM account WHERE user_id = ? AND is_del = 0) < ?
-						RETURNING account_id AS accountId, email, create_time AS createdAt
-					`)
-					.bind(item.address, item.local, userId, userId, MAX_MAILBOXES_PER_USER)
-			);
+			const origin = retrievalOrigin(c);
+			const tokenCandidates = await Promise.all(candidates.map(async item => {
+				const publicId = crypto.randomUUID();
+				const signature = await signPublicId(c, publicId);
+				const token = `${publicId}.${signature}`;
+				return {
+					...item,
+					publicId,
+					token,
+					codeUrl: `${origin}/api/mailbox-tools/code/${token}`
+				};
+			}));
+
+			const accountChunks = chunks(tokenCandidates);
+			const tokenChunks = chunks(tokenCandidates);
+			const statements = [];
+
+			// This zero-row guard becomes a deliberate NOT NULL violation only if
+			// another request used account/token capacity after our preflight read.
+			statements.push(c.env.db.prepare(`
+				INSERT INTO account (email, name, user_id)
+				SELECT NULL, '', ?
+				WHERE (
+					SELECT COUNT(*) FROM account WHERE user_id = ? AND is_del = 0
+				) + ? > ?
+				OR (
+					SELECT COUNT(*) FROM mailbox_api_token WHERE user_id = ? AND revoked_at IS NULL
+				) + ? > ?
+			`).bind(
+				userId,
+				userId,
+				countRequested,
+				MAX_MAILBOXES_PER_USER,
+				userId,
+				countRequested,
+				MAX_ACTIVE_TOKENS_PER_USER
+			));
+
+			for (const itemChunk of accountChunks) {
+				const bindings = itemChunk.flatMap(item => [item.address, item.local]);
+				statements.push(c.env.db.prepare(`
+					WITH candidates(email, name) AS (
+						VALUES ${valuesPlaceholders(itemChunk.length, 2)}
+					)
+					INSERT INTO account (email, name, user_id)
+					SELECT email, name, ? FROM candidates
+					RETURNING account_id AS accountId, email, create_time AS createdAt
+				`).bind(...bindings, userId));
+			}
+
+			for (const itemChunk of tokenChunks) {
+				const bindings = itemChunk.flatMap(item => [item.publicId, item.address]);
+				statements.push(c.env.db.prepare(`
+					WITH candidates(public_id, email) AS (
+						VALUES ${valuesPlaceholders(itemChunk.length, 2)}
+					)
+					INSERT INTO mailbox_api_token (public_id, user_id, account_id, label)
+					SELECT candidates.public_id, ?, account.account_id, ?
+					FROM candidates
+					INNER JOIN account
+						ON account.email = candidates.email COLLATE NOCASE
+						AND account.user_id = ?
+						AND account.is_del = ?
+					WHERE (
+						SELECT COUNT(*)
+						FROM mailbox_api_token existing
+						WHERE existing.user_id = ?
+							AND existing.account_id = account.account_id
+							AND existing.revoked_at IS NULL
+					) < ?
+					RETURNING
+						token_id AS id,
+						public_id AS publicId,
+						account_id AS accountId,
+						label,
+						created_at AS createdAt,
+						last_used_at AS lastUsedAt
+				`).bind(
+					...bindings,
+					userId,
+					AUTO_TOKEN_LABEL,
+					userId,
+					isDel.NORMAL,
+					userId,
+					MAX_ACTIVE_TOKENS_PER_ACCOUNT
+				));
+			}
+
+			// This assertion covers any unexpected account/token join mismatch.
+			// It intentionally violates public_id NOT NULL when fewer than N
+			// credentials were inserted, causing D1 to roll the transaction back.
+			const publicIds = tokenCandidates.map(item => item.publicId);
+			statements.push(c.env.db.prepare(`
+				INSERT INTO mailbox_api_token (public_id, user_id, account_id, label)
+				SELECT NULL, ?, 0, ''
+				WHERE (
+					SELECT COUNT(*)
+					FROM mailbox_api_token
+					WHERE user_id = ?
+						AND revoked_at IS NULL
+						AND public_id IN (${publicIds.map(() => '?').join(', ')})
+				) <> ?
+			`).bind(userId, userId, ...publicIds, countRequested));
 
 			try {
 				const batchResult = await c.env.db.batch(statements);
-				const created = batchResult.flatMap(item => item.results || []);
-				if (created.length !== countRequested) {
-					// This is only reachable if a concurrent request consumed the
-					// automation quota between the initial check and this transaction.
-					if (created.length > 0) {
-						const rollback = created.map(item => c.env.db.prepare(
-							'DELETE FROM account WHERE account_id = ? AND user_id = ?'
-						).bind(item.accountId, userId));
-						await c.env.db.batch(rollback);
-					}
-					throw new BizError('邮箱数量配额已被其他请求占用，请重试', 409);
+				const accountStart = 1;
+				const tokenStart = accountStart + accountChunks.length;
+				const createdAccounts = batchResult
+					.slice(accountStart, tokenStart)
+					.flatMap(item => item.results || []);
+				const insertedTokens = batchResult
+					.slice(tokenStart, tokenStart + tokenChunks.length)
+					.flatMap(item => item.results || []);
+
+				const candidateByEmail = new Map(tokenCandidates.map(item => [item.address.toLowerCase(), item]));
+				const tokenByAccountId = new Map(insertedTokens.map(item => [Number(item.accountId), item]));
+				const created = createdAccounts.map(accountRow => {
+					const candidate = candidateByEmail.get(String(accountRow.email || '').toLowerCase());
+					const tokenRow = tokenByAccountId.get(Number(accountRow.accountId));
+					if (!candidate || !tokenRow || tokenRow.publicId !== candidate.publicId) return null;
+					return {
+						...accountRow,
+						tokenId: tokenRow.id,
+						token: candidate.token,
+						codeUrl: candidate.codeUrl
+					};
+				});
+
+				if (
+					createdAccounts.length !== countRequested ||
+					insertedTokens.length !== countRequested ||
+					created.some(item => !item)
+				) {
+					await removeIncompleteBatch(c, userId, createdAccounts.map(item => Number(item.accountId)).filter(Boolean));
+					throw new BizError('批量创建未能完整生成取件 URL，请重试', 409);
 				}
 				const used = await accountService.countUserAccount(c, userId);
 				return {
@@ -293,6 +465,9 @@ const mailboxToolsService = {
 				};
 			} catch (error) {
 				if (error?.name === 'BizError') throw error;
+				if (isQuotaGuardConstraint(error)) {
+					throw new BizError('批量邮箱或取件 URL 配额已被并发请求占用，请重试', 409);
+				}
 				if (!isUniqueConstraint(error) || batchAttempt === 5) throw error;
 			}
 		}

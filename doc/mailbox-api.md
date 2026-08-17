@@ -67,6 +67,26 @@ Batch body example:
 {"count":10,"domain":"salvadawn.com","prefix":"api","length":10}
 ```
 
+Every newly created mailbox receives its own independent credential in the
+same response:
+
+```json
+{
+  "created": [
+    {
+      "accountId": 706,
+      "email": "api7m2k9p4x@salvadawn.com",
+      "tokenId": 3,
+      "token": "<mailbox-specific-credential>",
+      "codeUrl": "https://mail.salvadawn.com/api/mailbox-tools/code/<mailbox-specific-credential>"
+    }
+  ]
+}
+```
+
+Credentials are not shared between addresses. Revoking one mailbox URL does
+not affect the URLs belonging to the other mailboxes.
+
 Token body example:
 
 ```json
