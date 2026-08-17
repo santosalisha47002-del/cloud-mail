@@ -164,18 +164,64 @@
               <p>{{ $t('sharedLoginHint') }}</p>
             </div>
             <div class="section-actions">
-              <el-button @click="copyBatchRows">
+              <el-button :disabled="!selectedBatchCount" @click="copySelectedBatchRows">
                 <Icon icon="fluent-color:clipboard-24" width="17" height="17"/>
-                {{ $t('copyAll') }}
+                {{ $t('copySelected') }} ({{ selectedBatchCount }})
               </el-button>
-              <el-button type="primary" plain @click="downloadCsv">
+              <el-button type="primary" plain :disabled="!selectedBatchCount" @click="downloadSelectedBatchCsv">
                 <Icon icon="system-uicons:push-down" width="17" height="17"/>
-                {{ $t('downloadCsv') }}
+                {{ $t('exportSelected') }}
               </el-button>
+              <el-dropdown trigger="click">
+                <el-button link type="primary">
+                  {{ $t('moreActions') }}
+                  <Icon icon="ion:chevron-down" width="14" height="14"/>
+                </el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item @click="copyBatchRows">{{ $t('copyAll') }}</el-dropdown-item>
+                    <el-dropdown-item @click="downloadCsv">{{ $t('downloadCsv') }}</el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
             </div>
           </div>
 
-          <el-table :data="batchRows" stripe class="result-table">
+          <div class="list-toolbar">
+            <el-input
+                v-model="batchQuery"
+                class="list-search"
+                clearable
+                :placeholder="$t('filterMailboxPlaceholder')"
+            >
+              <template #prefix><Icon icon="iconoir:search" width="16" height="16"/></template>
+            </el-input>
+            <el-select v-model="batchDomain" class="domain-filter" :placeholder="$t('allDomains')">
+              <el-option :label="$t('allDomains')" value=""/>
+              <el-option v-for="domain in batchDomainOptions" :key="domain" :label="`@${domain}`" :value="domain"/>
+            </el-select>
+            <el-button
+                class="select-filtered-button"
+                :disabled="!filteredBatchRows.length"
+                @click="toggleBatchFilteredSelection"
+            >
+              <Icon icon="fluent:checkbox-multiple-16-regular" width="16" height="16"/>
+              {{ allFilteredBatchSelected ? $t('clearFilteredSelection') : $t('selectFiltered') }}
+            </el-button>
+            <el-button :disabled="!selectedBatchCount" @click="clearBatchSelection">{{ $t('clearSelection') }}</el-button>
+            <span v-if="selectedBatchCount" class="selection-summary">{{ $t('selectedCount', {count: selectedBatchCount}) }}</span>
+          </div>
+
+          <el-table
+              ref="batchTableRef"
+              :data="pagedBatchRows"
+              row-key="rowKey"
+              stripe
+              class="result-table"
+              @select="handleBatchRowSelect"
+              @select-all="handleBatchSelectAll"
+          >
+            <el-table-column type="selection" width="48" reserve-selection/>
             <el-table-column type="index" width="58" label="#"/>
             <el-table-column prop="email" :label="$t('emailAccount')" min-width="250">
               <template #default="scope">
@@ -224,6 +270,18 @@
               </template>
             </el-table-column>
           </el-table>
+          <el-pagination
+              v-if="batchTotal > 0"
+              class="list-pagination"
+              :current-page="batchPage"
+              :page-size="batchPageSize"
+              :page-sizes="[10, 20, 50, 100]"
+              :total="batchTotal"
+              background
+              layout="total, sizes, prev, pager, next, jumper"
+              @current-change="value => batchPage = value"
+              @size-change="handleBatchPageSizeChange"
+          />
         </section>
 
         <section class="tokens-panel">
@@ -232,6 +290,7 @@
               <div class="section-title-row">
                 <h2>{{ $t('activeRetrievalUrls') }}</h2>
                 <el-tag effect="plain">{{ tokenRows.length }}</el-tag>
+                <el-tag v-if="tokenQuery || tokenDomain" type="info" effect="plain">{{ tokenTotal }} {{ $t('filtered') }}</el-tag>
               </div>
               <p>{{ $t('activeRetrievalUrlsDesc') }}</p>
             </div>
@@ -239,9 +298,57 @@
 
           <div v-loading="tokenLoading" class="token-list-wrap">
             <el-empty v-if="!tokenLoading && !tokenRows.length" :description="$t('noRetrievalUrls')"/>
+            <template v-else>
+              <div class="list-toolbar token-toolbar">
+                <el-input
+                    v-model="tokenQuery"
+                    class="list-search"
+                    clearable
+                    :placeholder="$t('filterMailboxPlaceholder')"
+                >
+                  <template #prefix><Icon icon="iconoir:search" width="16" height="16"/></template>
+                </el-input>
+                <el-select v-model="tokenDomain" class="domain-filter" :placeholder="$t('allDomains')">
+                  <el-option :label="$t('allDomains')" value=""/>
+                  <el-option v-for="domain in tokenDomainOptions" :key="domain" :label="`@${domain}`" :value="domain"/>
+                </el-select>
+                <el-button
+                    class="select-filtered-button"
+                    :disabled="!filteredTokenRows.length"
+                    @click="toggleTokenFilteredSelection"
+                >
+                  <Icon icon="fluent:checkbox-multiple-16-regular" width="16" height="16"/>
+                  {{ allFilteredTokenSelected ? $t('clearFilteredSelection') : $t('selectFiltered') }}
+                </el-button>
+                <el-button :disabled="!selectedTokenCount" @click="clearTokenSelection">{{ $t('clearSelection') }}</el-button>
+                <span v-if="selectedTokenCount" class="selection-summary">{{ $t('selectedCount', {count: selectedTokenCount}) }}</span>
+                <el-button :disabled="!selectedTokenCount" @click="copySelectedTokenRows">
+                  <Icon icon="fluent-color:clipboard-24" width="16" height="16"/>
+                  {{ $t('copySelected') }}
+                </el-button>
+                <el-button type="primary" plain :disabled="!selectedTokenCount" @click="downloadSelectedTokenCsv">
+                  <Icon icon="system-uicons:push-down" width="16" height="16"/>
+                  {{ $t('exportSelected') }}
+                </el-button>
+              </div>
 
-            <div v-else class="token-list">
-              <article v-for="token in tokenRows" :key="token.rowKey" class="token-item">
+              <el-alert
+                  v-if="!filteredTokenRows.length"
+                  class="filter-empty"
+                  type="info"
+                  :closable="false"
+                  :title="$t('noFilteredMailboxes')"
+              />
+
+              <div v-else class="token-list">
+              <article v-for="token in pagedTokenRows" :key="token.rowKey" class="token-item">
+                <div class="token-select">
+                  <el-checkbox
+                      :model-value="selectedTokenKeys.has(token.rowKey)"
+                      :aria-label="$t('selectMailboxRow', {email: token.email || $t('unknownMailbox')})"
+                      @change="value => toggleTokenSelection(token, value)"
+                  />
+                </div>
                 <div class="token-main">
                   <div class="token-mail-icon" aria-hidden="true">
                     <Icon icon="hugeicons:mailbox-01" width="22" height="22"/>
@@ -287,7 +394,20 @@
                   <el-button size="small" type="danger" link @click="revokeToken(token)">{{ $t('revoke') }}</el-button>
                 </div>
               </article>
-            </div>
+              </div>
+              <el-pagination
+                  v-if="tokenTotal > 0"
+                  class="list-pagination"
+                  :current-page="tokenPage"
+                  :page-size="tokenPageSize"
+                  :page-sizes="[10, 20, 50, 100]"
+                  :total="tokenTotal"
+                  background
+                  layout="total, sizes, prev, pager, next, jumper"
+                  @current-change="value => tokenPage = value"
+                  @size-change="handleTokenPageSizeChange"
+              />
+            </template>
           </div>
         </section>
 
@@ -340,16 +460,24 @@
               show-icon
           />
           <div v-if="testDialog.messages.length" class="message-history">
-            <div class="history-summary">{{ $t('receivedMessageCount', {count: testDialog.messageCount}) }}</div>
+            <div class="history-summary-row">
+              <div class="history-summary">{{ $t('receivedMessageCount', {count: testDialog.messageCount}) }}</div>
+              <el-button size="small" plain type="primary" @click="copyMessages(testDialog.messages)">
+                <Icon icon="fluent-color:clipboard-24" width="15" height="15"/>
+                {{ $t('copyMessages') }}
+              </el-button>
+            </div>
             <article v-for="message in testDialog.messages" :key="message.emailId" class="history-item">
               <div class="history-item-main">
                 <strong v-if="message.verificationCode" class="history-code">{{ message.verificationCode }}</strong>
                 <span v-else class="history-no-code">{{ $t('messageWithoutCode') }}</span>
                 <span class="history-subject">{{ message.subject || '—' }}</span>
+                <el-button class="history-copy" link type="primary" @click="copyMessage(message)">{{ $t('copy') }}</el-button>
               </div>
               <small>
                 {{ $t('messageIdLabel') }} {{ message.emailId || '—' }}
                 <span v-if="message.from"> · {{ message.from }}</span>
+                <span v-if="message.receivedAt"> · {{ formatTime(message.receivedAt) }}</span>
               </small>
             </article>
           </div>
@@ -357,7 +485,16 @@
             <span>{{ $t('subject') }}</span>
             <strong>{{ testDialog.subject }}</strong>
           </div>
-          <pre v-if="testDialog.raw" class="raw-result"><code>{{ testDialog.raw }}</code></pre>
+          <div v-if="testDialog.raw" class="raw-result-wrap">
+            <div class="raw-result-toolbar">
+              <span>{{ $t('rawResponse') }}</span>
+              <el-button size="small" link type="primary" @click="copyText(testDialog.raw)">
+                <Icon icon="fluent-color:clipboard-24" width="15" height="15"/>
+                {{ $t('copyJson') }}
+              </el-button>
+            </div>
+            <pre class="raw-result"><code>{{ testDialog.raw }}</code></pre>
+          </div>
         </template>
       </div>
     </el-dialog>
@@ -365,7 +502,7 @@
 </template>
 
 <script setup>
-import {computed, onMounted, reactive, ref, watch} from 'vue'
+import {computed, nextTick, onMounted, reactive, ref, watch} from 'vue'
 import {Icon} from '@iconify/vue'
 import {useI18n} from 'vue-i18n'
 import {useSettingStore} from '@/store/setting.js'
@@ -393,6 +530,22 @@ const batchRows = ref([])
 const tokenRows = ref([])
 const accountOptions = ref([])
 const visibleTokens = reactive(new Set())
+
+// The retrieval list can grow into the hundreds or thousands of rows. Keep
+// filtering and paging client-side (the API already returns the complete set)
+// while tracking selected row keys so a selection survives page changes.
+const batchTableRef = ref(null)
+const batchQuery = ref('')
+const batchDomain = ref('')
+const batchPage = ref(1)
+const batchPageSize = ref(20)
+const selectedBatchKeys = reactive(new Set())
+
+const tokenQuery = ref('')
+const tokenDomain = ref('')
+const tokenPage = ref(1)
+const tokenPageSize = ref(20)
+const selectedTokenKeys = reactive(new Set())
 
 const batchForm = reactive({
   count: 10,
@@ -422,6 +575,55 @@ const domainOptions = computed(() => {
   return [...new Set((settingStore.domainList || []).map(normalizeDomain).filter(Boolean))]
 })
 
+const batchDomainOptions = computed(() => {
+  const domains = batchRows.value
+      .map(row => String(row.email || '').split('@').pop().toLowerCase())
+      .filter(Boolean)
+  return [...new Set(domains)].sort()
+})
+
+const tokenDomainOptions = computed(() => {
+  const domains = tokenRows.value
+      .map(row => String(row.email || '').split('@').pop().toLowerCase())
+      .filter(Boolean)
+  return [...new Set(domains)].sort()
+})
+
+function matchesMailbox(row, query, domain) {
+  const email = String(row?.email || '').toLowerCase()
+  const label = String(row?.label || '').toLowerCase()
+  const url = String(row?.url || '').toLowerCase()
+  const normalizedQuery = String(query || '').trim().toLowerCase()
+  const normalizedDomain = String(domain || '').trim().toLowerCase()
+  if (normalizedDomain && !email.endsWith(`@${normalizedDomain}`)) return false
+  if (!normalizedQuery) return true
+  return email.includes(normalizedQuery) || label.includes(normalizedQuery) || url.includes(normalizedQuery)
+}
+
+const filteredBatchRows = computed(() => batchRows.value.filter(row => matchesMailbox(row, batchQuery.value, batchDomain.value)))
+const batchTotal = computed(() => filteredBatchRows.value.length)
+const pagedBatchRows = computed(() => {
+  const start = (batchPage.value - 1) * batchPageSize.value
+  return filteredBatchRows.value.slice(start, start + batchPageSize.value)
+})
+const selectedBatchRows = computed(() => batchRows.value.filter(row => selectedBatchKeys.has(row.rowKey)))
+const selectedBatchCount = computed(() => selectedBatchRows.value.length)
+const allFilteredBatchSelected = computed(() => {
+  return filteredBatchRows.value.length > 0 && filteredBatchRows.value.every(row => selectedBatchKeys.has(row.rowKey))
+})
+
+const filteredTokenRows = computed(() => tokenRows.value.filter(row => matchesMailbox(row, tokenQuery.value, tokenDomain.value)))
+const tokenTotal = computed(() => filteredTokenRows.value.length)
+const pagedTokenRows = computed(() => {
+  const start = (tokenPage.value - 1) * tokenPageSize.value
+  return filteredTokenRows.value.slice(start, start + tokenPageSize.value)
+})
+const selectedTokenRows = computed(() => tokenRows.value.filter(row => selectedTokenKeys.has(row.rowKey)))
+const selectedTokenCount = computed(() => selectedTokenRows.value.length)
+const allFilteredTokenSelected = computed(() => {
+  return filteredTokenRows.value.length > 0 && filteredTokenRows.value.every(row => selectedTokenKeys.has(row.rowKey))
+})
+
 const mailboxPreview = computed(() => {
   const prefix = safePrefix(batchForm.prefix) || ''
   const random = 'x'.repeat(Math.min(Number(batchForm.length) || 0, 12))
@@ -433,6 +635,26 @@ watch(domainOptions, (domains) => {
     batchForm.domain = domains[0]
   }
 }, {immediate: true})
+
+watch([batchQuery, batchDomain], () => {
+  batchPage.value = 1
+})
+
+watch([tokenQuery, tokenDomain], () => {
+  tokenPage.value = 1
+})
+
+watch(batchTotal, total => {
+  const lastPage = Math.max(1, Math.ceil(total / batchPageSize.value))
+  if (batchPage.value > lastPage) batchPage.value = lastPage
+})
+
+watch(tokenTotal, total => {
+  const lastPage = Math.max(1, Math.ceil(total / tokenPageSize.value))
+  if (tokenPage.value > lastPage) tokenPage.value = lastPage
+})
+
+watch(pagedBatchRows, () => syncTableSelection(batchTableRef, pagedBatchRows.value, selectedBatchKeys))
 
 onMounted(async () => {
   seedCurrentAccount()
@@ -514,6 +736,9 @@ async function createBatch() {
       length: Number(batchForm.length)
     })
     batchRows.value = normalizeMailboxRows(data)
+    selectedBatchKeys.clear()
+    batchPage.value = 1
+    nextTick(() => batchTableRef.value?.clearSelection())
     batchRows.value.forEach(row => addAccountOption(row))
     accountStore.refreshAccountList()
     ElMessage({message: t('batchCreateSuccess', {count: batchRows.value.length}), type: 'success', plain: true})
@@ -545,6 +770,70 @@ function normalizeMailboxRows(data) {
   }).filter(item => item.email)
 }
 
+function syncTableSelection(tableRef, rows, selectedKeys) {
+  if (!tableRef.value) return
+  nextTick(() => {
+    rows.forEach(row => {
+      tableRef.value?.toggleRowSelection(row, selectedKeys.has(row.rowKey), true)
+    })
+  })
+}
+
+function handleBatchRowSelect(selection, row) {
+  if (selection.some(item => item.rowKey === row.rowKey)) selectedBatchKeys.add(row.rowKey)
+  else selectedBatchKeys.delete(row.rowKey)
+}
+
+function handleBatchSelectAll(selection) {
+  const visibleKeys = new Set(pagedBatchRows.value.map(row => row.rowKey))
+  visibleKeys.forEach(key => selectedBatchKeys.delete(key))
+  selection.forEach(row => selectedBatchKeys.add(row.rowKey))
+}
+
+function toggleBatchFilteredSelection() {
+  const rows = filteredBatchRows.value
+  const shouldClear = allFilteredBatchSelected.value
+  rows.forEach(row => {
+    if (shouldClear) selectedBatchKeys.delete(row.rowKey)
+    else selectedBatchKeys.add(row.rowKey)
+  })
+  syncTableSelection(batchTableRef, pagedBatchRows.value, selectedBatchKeys)
+}
+
+function clearBatchSelection() {
+  selectedBatchKeys.clear()
+  batchTableRef.value?.clearSelection()
+}
+
+function handleBatchPageSizeChange(value) {
+  batchPageSize.value = Number(value) || 20
+  batchPage.value = 1
+  syncTableSelection(batchTableRef, pagedBatchRows.value, selectedBatchKeys)
+}
+
+function toggleTokenSelection(row, selected) {
+  if (selected) selectedTokenKeys.add(row.rowKey)
+  else selectedTokenKeys.delete(row.rowKey)
+}
+
+function toggleTokenFilteredSelection() {
+  const rows = filteredTokenRows.value
+  const shouldClear = allFilteredTokenSelected.value
+  rows.forEach(row => {
+    if (shouldClear) selectedTokenKeys.delete(row.rowKey)
+    else selectedTokenKeys.add(row.rowKey)
+  })
+}
+
+function clearTokenSelection() {
+  selectedTokenKeys.clear()
+}
+
+function handleTokenPageSizeChange(value) {
+  tokenPageSize.value = Number(value) || 20
+  tokenPage.value = 1
+}
+
 async function refreshTokens() {
   tokenLoading.value = true
   try {
@@ -559,6 +848,12 @@ async function refreshTokens() {
     const source = Array.isArray(data) ? data : data?.items || data?.tokens || data?.list || []
     source.forEach(addAccountOption)
     tokenRows.value = source.map(normalizeTokenRow)
+    const availableKeys = new Set(tokenRows.value.map(row => row.rowKey))
+    Array.from(selectedTokenKeys).forEach(key => {
+      if (!availableKeys.has(key)) selectedTokenKeys.delete(key)
+    })
+    const lastPage = Math.max(1, Math.ceil(tokenRows.value.length / tokenPageSize.value))
+    if (tokenPage.value > lastPage) tokenPage.value = lastPage
   } finally {
     tokenLoading.value = false
   }
@@ -576,6 +871,7 @@ async function createToken() {
     if (source) {
       const row = normalizeTokenRow(source, 0)
       tokenRows.value = [row, ...tokenRows.value.filter(item => item.rowKey !== row.rowKey)]
+      selectedTokenKeys.delete(row.rowKey)
       visibleTokens.add(row.rowKey)
     } else {
       await refreshTokens()
@@ -628,6 +924,7 @@ async function revokeToken(token) {
   })
   await mailboxTokenDelete(token.id)
   tokenRows.value = tokenRows.value.filter(item => item.rowKey !== token.rowKey)
+  selectedTokenKeys.delete(token.rowKey)
   visibleTokens.delete(token.rowKey)
   ElMessage({message: t('urlRevoked'), type: 'success', plain: true})
 }
@@ -745,10 +1042,44 @@ async function copyText(value) {
   ElMessage({message: t('copySuccessMsg'), type: 'success', plain: true})
 }
 
+function messageCopyText(message) {
+  const lines = [
+    message?.email ? `${t('emailAccount')}: ${message.email}` : '',
+    message?.subject ? `${t('subject')}: ${message.subject}` : '',
+    message?.from ? `${t('from')}: ${message.from}` : '',
+    message?.receivedAt ? `${t('receivedAt')}: ${formatTime(message.receivedAt)}` : '',
+    message?.emailId ? `${t('messageIdLabel')}: ${message.emailId}` : '',
+    (message?.verificationCode || message?.code) ? `${t('verificationCode')}: ${message.verificationCode || message.code}` : ''
+  ]
+  return lines.filter(Boolean).join('\n')
+}
+
+function copyMessage(message) {
+  return copyText(messageCopyText(message))
+}
+
+function copyMessages(messages) {
+  return copyText(messages.map(messageCopyText).filter(Boolean).join('\n\n'))
+}
+
 function copyBatchRows() {
-  return copyText(batchRows.value
+  return copyMailboxRows(batchRows.value)
+}
+
+function copySelectedBatchRows() {
+  return copyMailboxRows(selectedBatchRows.value)
+}
+
+function copySelectedTokenRows() {
+  return copyMailboxRows(selectedTokenRows.value)
+}
+
+function copyMailboxRows(rows) {
+  const value = rows
+      .filter(row => row?.email)
       .map(row => row.url ? `${row.email}\t${row.url}` : row.email)
-      .join('\n'))
+      .join('\n')
+  return copyText(value)
 }
 
 function csvCell(value) {
@@ -756,16 +1087,28 @@ function csvCell(value) {
 }
 
 function downloadCsv() {
+  return downloadMailboxCsv(batchRows.value)
+}
+
+function downloadSelectedBatchCsv() {
+  return downloadMailboxCsv(selectedBatchRows.value)
+}
+
+function downloadSelectedTokenCsv() {
+  return downloadMailboxCsv(selectedTokenRows.value)
+}
+
+function downloadMailboxCsv(rows) {
   const lines = [
-    ['email', 'accountId', 'retrievalUrl'],
-    ...batchRows.value.map(row => [row.email, row.accountId || '', row.url || ''])
+    ['email', 'retrievalUrl'],
+    ...rows.filter(row => row?.email).map(row => [row.email, row.url || ''])
   ].map(row => row.map(csvCell).join(','))
 
   const blob = new Blob([`\uFEFF${lines.join('\r\n')}`], {type: 'text/csv;charset=utf-8'})
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
-  link.download = `mailboxes-${new Date().toISOString().slice(0, 10)}.csv`
+  link.download = `mailbox-retrieval-urls-${new Date().toISOString().slice(0, 10)}.csv`
   document.body.appendChild(link)
   link.click()
   link.remove()
@@ -1051,6 +1394,49 @@ function downloadCsv() {
   margin-left: 0;
 }
 
+.list-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+  padding: 10px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 9px;
+  background: var(--extra-light-fill);
+}
+
+.list-search {
+  width: min(300px, 100%);
+}
+
+.domain-filter {
+  width: 150px;
+}
+
+.select-filtered-button :deep(span),
+.list-toolbar .el-button :deep(span) {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.selection-summary {
+  margin-left: auto;
+  color: var(--el-color-primary);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.list-pagination {
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+
+.filter-empty {
+  margin-top: 14px;
+}
+
 .result-table {
   width: 100%;
   margin-top: 16px;
@@ -1094,7 +1480,7 @@ function downloadCsv() {
 
 .token-item {
   display: grid;
-  grid-template-columns: minmax(190px, .8fr) minmax(340px, 1.7fr) auto;
+  grid-template-columns: 28px minmax(190px, .8fr) minmax(340px, 1.7fr) auto;
   align-items: center;
   gap: 18px;
   padding: 15px;
@@ -1102,6 +1488,12 @@ function downloadCsv() {
   border-radius: 11px;
   background: var(--extra-light-fill);
   transition: border-color .2s, transform .2s;
+}
+
+.token-select {
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 @media (hover: hover) {
@@ -1304,6 +1696,21 @@ function downloadCsv() {
   font-weight: 650;
 }
 
+.history-summary-row,
+.raw-result-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.history-summary-row .el-button :deep(span),
+.raw-result-toolbar .el-button :deep(span) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .history-item {
   display: grid;
   gap: 4px;
@@ -1340,6 +1747,11 @@ function downloadCsv() {
   white-space: nowrap;
 }
 
+.history-copy {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
 .history-item small {
   color: var(--secondary-text-color);
   font-size: 10px;
@@ -1350,9 +1762,23 @@ function downloadCsv() {
   margin-top: 13px;
 }
 
+.raw-result-wrap {
+  margin-top: 13px;
+}
+
+.raw-result-wrap .raw-result {
+  margin-top: 6px;
+}
+
+.raw-result-toolbar {
+  color: var(--secondary-text-color);
+  font-size: 11px;
+  font-weight: 650;
+}
+
 @media (max-width: 1100px) {
   .token-item {
-    grid-template-columns: minmax(210px, .8fr) minmax(330px, 1.2fr);
+    grid-template-columns: 28px minmax(210px, .8fr) minmax(330px, 1.2fr);
   }
 
   .token-actions {
@@ -1445,6 +1871,21 @@ function downloadCsv() {
 
   .token-item {
     padding: 13px;
+  }
+
+  .list-toolbar {
+    align-items: stretch;
+  }
+
+  .list-search,
+  .domain-filter,
+  .list-toolbar .el-button {
+    width: 100%;
+  }
+
+  .selection-summary {
+    width: 100%;
+    margin-left: 0;
   }
 
   .token-actions .el-button {
