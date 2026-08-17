@@ -7,6 +7,7 @@ import userService from '../service/user-service';
 import permService from '../service/perm-service';
 import { t } from '../i18n/i18n'
 import app from '../hono/hono';
+import { isPublicMailboxCodeRequest } from './mailbox-code-route';
 
 const exclude = [
 	'/login',
@@ -27,6 +28,7 @@ const requirePerms = [
 	'/account/list',
 	'/account/delete',
 	'/account/add',
+	'/mailbox-tools/batch-create',
 	'/my/delete',
 	'/analysis/echarts',
 	'/role/add',
@@ -64,7 +66,7 @@ const requirePerms = [
 const premKey = {
 	'email:delete': ['/email/delete'],
 	'email:send': ['/email/send'],
-	'account:add': ['/account/add'],
+	'account:add': ['/account/add', '/mailbox-tools/batch-create'],
 	'account:query': ['/account/list'],
 	'account:delete': ['/account/delete'],
 	'my:delete': ['/my/delete'],
@@ -92,6 +94,9 @@ const premKey = {
 app.use('*', async (c, next) => {
 
 	const path = c.req.path;
+	if (isPublicMailboxCodeRequest(path, c.req.method)) {
+		return await next();
+	}
 
 	const index = exclude.findIndex(item => {
 		return path.startsWith(item);

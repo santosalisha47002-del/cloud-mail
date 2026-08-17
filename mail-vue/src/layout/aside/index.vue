@@ -26,6 +26,11 @@
           <Icon icon="solar:star-line-duotone" width="20" height="20" />
           <span class="menu-name" style="margin-left: 21px">{{$t('starred')}}</span>
         </el-menu-item>
+        <el-menu-item @click="router.push({name: 'mailbox-tools'})" index="mailbox-tools"
+                      :class="route.meta.name === 'mailbox-tools' ? 'choose-item' : ''">
+          <Icon icon="fluent:mail-link-20-regular" width="21" height="21" />
+          <span class="menu-name" style="margin-left: 20px">{{$t('mailboxTools')}}</span>
+        </el-menu-item>
         <el-menu-item @click="router.push({name: 'setting'})" index="setting"
                       :class="route.meta.name === 'setting' ? 'choose-item' : ''">
           <Icon icon="fluent:settings-48-regular" width="20" height="20" />

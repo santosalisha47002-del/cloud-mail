@@ -189,6 +189,10 @@ watch(() => accountStore.changeUserAccountName, () => {
   accounts[0].name = accountStore.changeUserAccountName
 })
 
+watch(() => accountStore.refreshList, () => {
+  refresh()
+})
+
 watch(() => settingStore.domainList, (list) => {
   if (!addForm.suffix && list.length > 0) {
     addForm.suffix = list[0]

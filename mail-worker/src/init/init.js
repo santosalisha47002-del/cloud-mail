@@ -1,6 +1,7 @@
 import settingService from '../service/setting-service';
 import emailUtils from '../utils/email-utils';
 import {emailConst} from "../const/entity-const";
+import { ensureMailboxToolsSchema } from './mailbox-tools-schema';
 
 const dbInit = {
 	async init(c) {
@@ -29,8 +30,13 @@ const dbInit = {
 		await this.v2_8DB(c);
 		await this.v2_9DB(c);
 		await this.v3_0DB(c);
+		await this.v3_1DB(c);
 		await settingService.refresh(c);
 		return c.text('success');
+	},
+
+	async v3_1DB(c) {
+		await ensureMailboxToolsSchema(c);
 	},
 
 	async v3_0DB(c) {

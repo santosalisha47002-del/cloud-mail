@@ -51,6 +51,16 @@ const routes = [
                     menu: true
                 }
             },
+            {
+                path: '/mailbox-tools',
+                name: 'mailbox-tools',
+                component: () => import('@/views/mailbox-tools/index.vue'),
+                meta: {
+                    title: 'mailboxApiTitle',
+                    name: 'mailbox-tools',
+                    menu: true
+                }
+            },
         ]
 
     },
