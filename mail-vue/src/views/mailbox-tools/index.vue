@@ -485,7 +485,8 @@
             <span>{{ $t('subject') }}</span>
             <strong>{{ testDialog.subject }}</strong>
           </div>
-          <div v-if="testDialog.raw" class="raw-result-wrap">
+          <details v-if="testDialog.raw" class="raw-result-wrap">
+            <summary>{{ $t('rawResponse') }}</summary>
             <div class="raw-result-toolbar">
               <span>{{ $t('rawResponse') }}</span>
               <el-button size="small" link type="primary" @click="copyText(testDialog.raw)">
@@ -494,7 +495,7 @@
               </el-button>
             </div>
             <pre class="raw-result"><code>{{ testDialog.raw }}</code></pre>
-          </div>
+          </details>
         </template>
       </div>
     </el-dialog>
@@ -1764,6 +1765,14 @@ function downloadMailboxCsv(rows) {
 
 .raw-result-wrap {
   margin-top: 13px;
+}
+
+.raw-result-wrap > summary {
+  color: var(--secondary-text-color);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+  user-select: none;
 }
 
 .raw-result-wrap .raw-result {
