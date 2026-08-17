@@ -338,6 +338,7 @@ const en = {
     searchSender: 'Search by Sender',
     userEmail: 'Email Address',
     mailboxTools: 'Mailbox Tools',
+    mailboxManagement: 'Mailbox Management',
     mailboxApiTitle: 'Bulk Mailboxes & Retrieval API',
     mailboxApiSubtitle: 'Create random mailboxes in bulk and generate a dedicated URL that reads verification codes',
     receivingReady: 'Receiving service ready',

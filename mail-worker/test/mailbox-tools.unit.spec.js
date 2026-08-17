@@ -3,6 +3,8 @@ import mailboxToolsService, {
 	buildRetrievalResult,
 	extractVerificationCode,
 	MAILBOX_LAST_USED_TOUCH_SQL,
+	normalizeEnsureTokenAccountIds,
+	normalizeMailboxListOptions,
 	normalizeRetrievalOptions
 } from '../src/service/mailbox-tools-service';
 import { isMailboxCodeCredential, isPublicMailboxCodeRequest } from '../src/security/mailbox-code-route';
@@ -104,6 +106,157 @@ describe('batch mailbox retrieval credentials', () => {
 		expect(batches[0]).toHaveLength(4);
 		expect(batches[0][0].sql).toMatch(/COUNT\(\*\).*mailbox_api_token/is);
 		expect(batches[0].at(-1).sql).toMatch(/public_id IN/is);
+	});
+});
+
+describe('mailbox management inventory', () => {
+	it('strictly normalizes pagination, filters, and ensure-token ids', () => {
+		expect(normalizeMailboxListOptions({
+			page: '3',
+			pageSize: '100',
+			keyword: ' Verify ',
+			domain: '@SalvaDawn.com',
+			tokenStatus: 'ACTIVE'
+		})).toEqual({
+			page: 3,
+			pageSize: 100,
+			keyword: 'verify',
+			domain: 'salvadawn.com',
+			tokenStatus: 'active'
+		});
+		expect(normalizeEnsureTokenAccountIds({accountIds: [7, '8', 7]})).toEqual([7, 8]);
+		expect(() => normalizeMailboxListOptions({pageSize: 101})).toThrow(/1-100/);
+		expect(() => normalizeMailboxListOptions({tokenStatus: 'revoked'})).toThrow(/all、active 或 missing/);
+		expect(() => normalizeEnsureTokenAccountIds({accountIds: []})).toThrow(/非空数组/);
+	});
+
+	it('returns one mailbox row per account with a canonical owned URL and global stats', async () => {
+		const prepared = [];
+		const bindChecked = (statement, bindings) => {
+			const placeholders = (statement.match(/\?/g) || []).length;
+			expect(bindings).toHaveLength(placeholders);
+		};
+		const db = {
+			prepare(sql) {
+				const statement = {
+					sql,
+					bindings: [],
+					bind(...bindings) {
+						bindChecked(sql, bindings);
+						this.bindings = bindings;
+						return this;
+					},
+					async first() {
+						if (/AS withApi/i.test(sql)) return {total: 14, withApi: 11, totalMessages: 39};
+						return {total: 1};
+					},
+					async all() {
+						if (/FROM account a[\s\S]+ORDER BY a\.account_id DESC/i.test(sql)) {
+							return {results: [{
+								accountId: 707,
+								email: 'verify@salvadawn.com',
+								name: 'verify',
+								tokenCount: 2,
+								messageCount: 5,
+								unreadCount: 1,
+								latestEmailId: 900,
+								latestEmailTime: '2026-08-17 12:00:00'
+							}]};
+						}
+						if (/FROM mailbox_api_token\s+t\b/i.test(sql)) {
+							return {results: [{
+								id: 44,
+								publicId: '123e4567-e89b-42d3-a456-426614174000',
+								accountId: 707,
+								email: 'verify@salvadawn.com',
+								label: 'latest',
+								createdAt: '2026-08-17 11:00:00'
+							}]};
+						}
+						return {results: []};
+					}
+				};
+				prepared.push(statement);
+				return statement;
+			}
+		};
+		const context = {
+			env: {db, domain: ['salvadawn.com'], jwt_secret: 'unit-test-secret'},
+			req: {url: 'https://mail.salvadawn.com/api/mailbox-tools/mailboxes'}
+		};
+
+		const result = await mailboxToolsService.listMailboxes(context, {
+			page: 1,
+			pageSize: 20,
+			keyword: '707',
+			domain: 'salvadawn.com',
+			tokenStatus: 'active'
+		}, 19);
+
+		expect(result.total).toBe(1);
+		expect(result.stats).toEqual({total: 14, withApi: 11, withoutApi: 3, totalMessages: 39});
+		expect(result.list).toHaveLength(1);
+		expect(result.list[0]).toMatchObject({
+			accountId: 707,
+			email: 'verify@salvadawn.com',
+			tokenCount: 2,
+			messageCount: 5,
+			unreadCount: 1,
+			hasToken: true
+		});
+		expect(result.list[0].tokens).toHaveLength(1);
+		expect(result.list[0].codeUrl).toMatch(/^https:\/\/mail\.salvadawn\.com\/api\/mailbox-tools\/code\//);
+		expect(prepared.find(item => /FROM mailbox_api_token\s+t\b/i.test(item.sql)).sql).toMatch(/NOT EXISTS[\s\S]+newer_token/i);
+	});
+
+	it('reads only one owned mailbox and returns bounded plain message history', async () => {
+		const db = {
+			prepare(sql) {
+				return {
+					sql,
+					bindings: [],
+					bind(...bindings) {
+						expect(bindings).toHaveLength((sql.match(/\?/g) || []).length);
+						this.bindings = bindings;
+						return this;
+					},
+					async first() {
+						return {accountId: 707, email: 'verify@salvadawn.com', name: 'verify'};
+					},
+					async all() {
+						return {results: [
+							{emailId: 99, sendEmail: 'a@example.net', subject: '<b>First</b>', code: '111111', text: 'Code 111111', content: '<script>alert(1)</script>', createTime: '2026-08-17 10:00:00'},
+							{emailId: 98, sendEmail: 'b@example.net', subject: 'Second', code: '', text: '', content: '<p>Hello <b>there</b></p>', createTime: '2026-08-17 09:00:00'},
+							{emailId: 97, sendEmail: 'c@example.net', subject: 'Third', code: '', text: 'overflow'}
+						]};
+					}
+				};
+			}
+		};
+		const result = await mailboxToolsService.managedMailboxMessages({env: {db}}, 707, {
+			beforeEmailId: 100,
+			limit: 2
+		}, 19);
+
+		expect(result.messages).toHaveLength(2);
+		expect(result.messages[0]).toMatchObject({
+			email: 'verify@salvadawn.com',
+			emailId: 99,
+			verificationCode: '111111'
+		});
+		expect(result.messages[1].preview).toBe('Hello there');
+		expect(result.messages[1]).not.toHaveProperty('content');
+		expect(result).toMatchObject({hasOlder: true, hasNewer: true, nextBeforeEmailId: 98, nextAfterEmailId: 99});
+	});
+
+	it('rejects mailbox message access when the account is not owned', async () => {
+		const db = {
+			prepare() {
+				return {bind() { return this; }, async first() { return null; }};
+			}
+		};
+		await expect(mailboxToolsService.managedMailboxMessages({env: {db}}, 707, {}, 20))
+			.rejects.toThrow(/不存在或不属于当前用户/);
 	});
 });
 

@@ -338,6 +338,7 @@ const zh = {
     searchSender: '搜索发件人',
     userEmail: '用户邮箱',
     mailboxTools: '邮箱工具',
+    mailboxManagement: '邮箱管理',
     mailboxApiTitle: '批量邮箱与取件 API',
     mailboxApiSubtitle: '批量创建随机邮箱，并为任意现有邮箱生成可直接读取验证码的专属 URL',
     receivingReady: '收件服务已就绪',

@@ -14,6 +14,26 @@ app.post('/mailbox-tools/batch-create', async c => {
 	return c.json(result.ok(data));
 });
 
+app.get('/mailbox-tools/mailboxes', async c => {
+	const data = await mailboxToolsService.listMailboxes(c, c.req.query(), userContext.getUserId(c));
+	return c.json(result.ok(data));
+});
+
+app.post('/mailbox-tools/mailboxes/ensure-tokens', async c => {
+	const data = await mailboxToolsService.ensureMailboxTokens(c, await c.req.json(), userContext.getUserId(c));
+	return c.json(result.ok(data));
+});
+
+app.get('/mailbox-tools/mailboxes/:accountId/messages', async c => {
+	const data = await mailboxToolsService.managedMailboxMessages(
+		c,
+		c.req.param('accountId'),
+		c.req.query(),
+		userContext.getUserId(c)
+	);
+	return c.json(result.ok(data));
+});
+
 app.get('/mailbox-tools/tokens', async c => {
 	const data = await mailboxToolsService.listTokens(c, userContext.getUserId(c));
 	return c.json(result.ok(data));

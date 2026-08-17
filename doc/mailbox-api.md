@@ -123,11 +123,55 @@ Cloud Mail uses the raw login JWT in the `Authorization` header (without a
 
 ```text
 POST   /api/mailbox-tools/batch-create
+GET    /api/mailbox-tools/mailboxes
+POST   /api/mailbox-tools/mailboxes/ensure-tokens
+GET    /api/mailbox-tools/mailboxes/:accountId/messages
 GET    /api/mailbox-tools/tokens
 POST   /api/mailbox-tools/tokens
 GET    /api/mailbox-tools/tokens/:tokenId/test
 DELETE /api/mailbox-tools/tokens/:tokenId
 ```
+
+The **邮箱管理 / Mailbox Management** page is available from the left menu at
+`/mailbox-management`. It is an owner-scoped inventory of every active mailbox,
+not just mailboxes that already have a retrieval token. It supports server-side
+search, domain and API-status filters, page sizes of 10/20/50/100, selection
+across pages, bulk copy/export, one-click creation of missing retrieval URLs,
+and a mailbox drawer that shows received-message history.
+
+List mailboxes with server-side pagination:
+
+```text
+GET /api/mailbox-tools/mailboxes?page=1&pageSize=20&keyword=&domain=&tokenStatus=all
+```
+
+`tokenStatus` is `all`, `active`, or `missing`. The response contains `list`,
+`total`, `pageCount`, global `stats`, and each mailbox's canonical newest active
+`primaryToken`/`codeUrl`. A mailbox with multiple active credentials is returned
+once; `tokenCount` reports the total active credentials.
+
+Create a URL for selected mailboxes that currently have none (the operation is
+idempotent and accepts at most 100 IDs per request):
+
+```http
+POST /api/mailbox-tools/mailboxes/ensure-tokens
+Content-Type: application/json
+
+{"accountIds":[707,758]}
+```
+
+Read one mailbox's received history without requiring a retrieval URL:
+
+```text
+GET /api/mailbox-tools/mailboxes/707/messages?limit=20
+GET /api/mailbox-tools/mailboxes/707/messages?beforeEmailId=706&limit=20
+GET /api/mailbox-tools/mailboxes/707/messages?afterEmailId=706&limit=20
+```
+
+The message endpoint always checks both the signed-in owner and the active
+mailbox row. It returns bounded plain-text previews, subjects, senders, times,
+and extracted verification codes; raw HTML is not rendered by the management
+page.
 
 Batch body example:
 

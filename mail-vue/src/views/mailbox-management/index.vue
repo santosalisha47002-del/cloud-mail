@@ -22,19 +22,19 @@
         <section class="summary-grid">
           <article class="summary-card">
             <span class="summary-icon blue"><Icon icon="hugeicons:mailbox-01" width="21" height="21"/></span>
-            <div><strong>{{ total }}</strong><span>{{ tr('allMailboxes') }}</span></div>
+            <div><strong>{{ inventoryStats.total }}</strong><span>{{ tr('allMailboxes') }}</span></div>
           </article>
           <article class="summary-card">
             <span class="summary-icon green"><Icon icon="fluent:link-24-regular" width="21" height="21"/></span>
-            <div><strong>{{ activeOnPage }}</strong><span>{{ tr('activeOnPage') }}</span></div>
+            <div><strong>{{ inventoryStats.withApi }}</strong><span>{{ tr('apiReadyTotal') }}</span></div>
           </article>
           <article class="summary-card">
             <span class="summary-icon amber"><Icon icon="fluent:link-dismiss-24-regular" width="21" height="21"/></span>
-            <div><strong>{{ missingOnPage }}</strong><span>{{ tr('missingOnPage') }}</span></div>
+            <div><strong>{{ inventoryStats.withoutApi }}</strong><span>{{ tr('apiMissingTotal') }}</span></div>
           </article>
           <article class="summary-card">
-            <span class="summary-icon violet"><Icon icon="fluent:checkbox-checked-24-regular" width="21" height="21"/></span>
-            <div><strong>{{ selectedCount }}</strong><span>{{ tr('selectedAcrossPages') }}</span></div>
+            <span class="summary-icon violet"><Icon icon="fluent:mail-multiple-24-regular" width="21" height="21"/></span>
+            <div><strong>{{ inventoryStats.totalMessages }}</strong><span>{{ tr('allMessages') }}</span></div>
           </article>
         </section>
 
@@ -317,7 +317,7 @@
 </template>
 
 <script setup>
-import {computed, nextTick, onMounted, reactive, ref} from 'vue'
+import {computed, defineOptions, nextTick, onMounted, reactive, ref} from 'vue'
 import {Icon} from '@iconify/vue'
 import {useI18n} from 'vue-i18n'
 import {useSettingStore} from '@/store/setting.js'
@@ -330,10 +330,12 @@ import {
 const {locale} = useI18n()
 const settingStore = useSettingStore()
 
+defineOptions({name: 'mailbox-management'})
+
 const translations = {
   zh: {
     title: '邮箱管理', subtitle: '集中查看所有邮箱、取件 API 和历史邮件，批量管理更轻松', refresh: '刷新',
-    allMailboxes: '全部邮箱', activeOnPage: '本页已有 API', missingOnPage: '本页缺少 API', selectedAcrossPages: '跨页已选择',
+    allMailboxes: '全部邮箱', apiReadyTotal: '已有取件 API', apiMissingTotal: '缺少取件 API', allMessages: '累计收到邮件',
     inventory: '所有邮箱', inventoryDesc: '筛选、选择并导出邮箱和专属取件 URL', selectAllFiltered: '选择全部筛选结果',
     clearSelection: '清空选择', searchPlaceholder: '搜索邮箱、备注或 Account ID', allDomains: '全部域名',
     allStatus: '全部状态', apiReady: '已有 API', apiMissing: '缺少 API', search: '查询',
@@ -351,7 +353,7 @@ const translations = {
   },
   en: {
     title: 'Mailbox Management', subtitle: 'Manage every mailbox, retrieval API, and message history in one place', refresh: 'Refresh',
-    allMailboxes: 'All mailboxes', activeOnPage: 'APIs on page', missingOnPage: 'Missing on page', selectedAcrossPages: 'Selected across pages',
+    allMailboxes: 'All mailboxes', apiReadyTotal: 'Retrieval APIs ready', apiMissingTotal: 'Retrieval APIs missing', allMessages: 'Messages received',
     inventory: 'All Mailboxes', inventoryDesc: 'Filter, select, and export addresses with their private retrieval URLs', selectAllFiltered: 'Select all filtered',
     clearSelection: 'Clear selection', searchPlaceholder: 'Search email, label, or Account ID', allDomains: 'All domains',
     allStatus: 'All statuses', apiReady: 'API ready', apiMissing: 'API missing', search: 'Search',
@@ -381,6 +383,7 @@ function tr(key, values = {}) {
 const loading = ref(false)
 const rows = ref([])
 const total = ref(0)
+const inventoryStats = reactive({total: 0, withApi: 0, withoutApi: 0, totalMessages: 0})
 const page = ref(1)
 const pageSize = ref(20)
 const draftKeyword = ref('')
@@ -414,8 +417,6 @@ const tokenStatusOptions = computed(() => [
   {label: tr('apiReady'), value: 'active'},
   {label: tr('apiMissing'), value: 'missing'}
 ])
-const activeOnPage = computed(() => rows.value.filter(row => row.codeUrl).length)
-const missingOnPage = computed(() => rows.value.filter(row => !row.codeUrl).length)
 const selectedList = computed(() => Array.from(selectedRows.values()))
 const selectedCount = computed(() => selectedRows.size)
 const selectedMissingCount = computed(() => selectedList.value.filter(row => !row.codeUrl).length)
@@ -439,6 +440,11 @@ async function loadRows() {
     const data = await managedMailboxList({page: page.value, pageSize: pageSize.value, ...filters})
     rows.value = (data?.list || data?.items || []).map(normalizeMailbox)
     total.value = Number(data?.total) || 0
+    const stats = data?.stats || {}
+    inventoryStats.total = Number(stats.total ?? data?.total) || 0
+    inventoryStats.withApi = Number(stats.withApi) || 0
+    inventoryStats.withoutApi = Number(stats.withoutApi) || 0
+    inventoryStats.totalMessages = Number(stats.totalMessages) || 0
     rows.value.forEach(row => {
       if (selectedRows.has(row.accountId)) selectedRows.set(row.accountId, row)
     })

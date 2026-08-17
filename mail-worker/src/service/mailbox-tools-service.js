@@ -24,7 +24,13 @@ const MAX_ACTIVE_TOKENS_PER_USER = MAX_MAILBOXES_PER_USER * MAX_ACTIVE_TOKENS_PE
 const BATCH_SQL_CHUNK_SIZE = 25;
 const DEFAULT_RETRIEVAL_LIMIT = 20;
 const MAX_RETRIEVAL_LIMIT = 50;
+const DEFAULT_MAILBOX_PAGE_SIZE = 20;
+const MAX_MAILBOX_PAGE_SIZE = 100;
+const MAX_MAILBOX_PAGE = 1000000;
+const MAX_MAILBOX_SEARCH_LENGTH = 128;
+const MAX_ENSURE_TOKEN_ACCOUNTS = 100;
 const AUTO_TOKEN_LABEL = 'batch-created';
+const MANAGED_TOKEN_LABEL = 'mailbox-management';
 const TOKEN_PURPOSE = 'cloud-mail:mailbox-api:v1:';
 const RANDOM_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
 
@@ -150,10 +156,14 @@ async function countActiveUserTokens(c, userId) {
 	const row = await c.env.db
 		.prepare(`
 			SELECT COUNT(*) AS total
-			FROM mailbox_api_token
-			WHERE user_id = ? AND revoked_at IS NULL
+			FROM mailbox_api_token token
+			INNER JOIN account owned
+				ON owned.account_id = token.account_id
+				AND owned.user_id = token.user_id
+				AND owned.is_del = ?
+			WHERE token.user_id = ? AND token.revoked_at IS NULL
 		`)
-		.bind(userId)
+		.bind(isDel.NORMAL, userId)
 		.first();
 	return Number(row?.total || 0);
 }
@@ -178,6 +188,101 @@ async function removeIncompleteBatch(c, userId, accountIds) {
 function retrievalOrigin(c) {
 	const configured = String(c.env.mailbox_api_origin || '').trim().replace(/\/$/, '');
 	return configured || new URL(c.req.url).origin;
+}
+
+function rowsFromD1(result) {
+	if (Array.isArray(result)) return result;
+	return Array.isArray(result?.results) ? result.results : [];
+}
+
+function normalizePositiveInteger(value, fallback, maximum, label) {
+	if (value === undefined || value === null || value === '') return fallback;
+	const parsed = Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) {
+		throw new BizError(`${label} 必须是 1-${maximum} 的整数`, 400);
+	}
+	return parsed;
+}
+
+/**
+ * Normalize the authenticated mailbox-management list query. Keeping this
+ * strict prevents very large offsets and accidental wildcard-style searches
+ * from turning a management page into an unbounded D1 scan.
+ */
+export function normalizeMailboxListOptions(params = {}) {
+	const keyword = String(params.keyword || '').trim().toLowerCase();
+	if (keyword.length > MAX_MAILBOX_SEARCH_LENGTH) {
+		throw new BizError(`keyword 最多 ${MAX_MAILBOX_SEARCH_LENGTH} 个字符`, 400);
+	}
+
+	const domain = normalizeDomain(params.domain);
+	if (domain && !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(domain)) {
+		throw new BizError('domain 格式无效', 400);
+	}
+
+	const tokenStatus = String(params.tokenStatus || 'all').trim().toLowerCase();
+	if (!['all', 'active', 'missing'].includes(tokenStatus)) {
+		throw new BizError('tokenStatus 必须是 all、active 或 missing', 400);
+	}
+
+	return {
+		page: normalizePositiveInteger(params.page, 1, MAX_MAILBOX_PAGE, 'page'),
+		pageSize: normalizePositiveInteger(params.pageSize, DEFAULT_MAILBOX_PAGE_SIZE, MAX_MAILBOX_PAGE_SIZE, 'pageSize'),
+		keyword,
+		domain,
+		tokenStatus
+	};
+}
+
+export function normalizeEnsureTokenAccountIds(params = {}) {
+	if (!Array.isArray(params.accountIds) || params.accountIds.length === 0) {
+		throw new BizError('accountIds 必须是非空数组', 400);
+	}
+	if (params.accountIds.length > MAX_ENSURE_TOKEN_ACCOUNTS) {
+		throw new BizError(`单次最多处理 ${MAX_ENSURE_TOKEN_ACCOUNTS} 个邮箱`, 400);
+	}
+
+	const accountIds = [];
+	const seen = new Set();
+	for (const value of params.accountIds) {
+		const accountId = Number(value);
+		if (!Number.isSafeInteger(accountId) || accountId < 1) {
+			throw new BizError('accountIds 只能包含正整数', 400);
+		}
+		if (seen.has(accountId)) continue;
+		seen.add(accountId);
+		accountIds.push(accountId);
+	}
+	return accountIds;
+}
+
+function mailboxFilterSql(options, userId) {
+	const conditions = ['a.user_id = ?', 'a.is_del = ?'];
+	const bindings = [userId, isDel.NORMAL];
+	if (options.keyword) {
+		conditions.push('(instr(lower(a.email), ?) > 0 OR instr(lower(a.name), ?) > 0 OR instr(CAST(a.account_id AS TEXT), ?) > 0)');
+		bindings.push(options.keyword, options.keyword, options.keyword);
+	}
+	if (options.domain) {
+		conditions.push("lower(substr(a.email, instr(a.email, '@') + 1)) = ?");
+		bindings.push(options.domain);
+	}
+	if (options.tokenStatus === 'active') {
+		conditions.push(`EXISTS (
+			SELECT 1 FROM mailbox_api_token active_token
+			WHERE active_token.user_id = a.user_id
+				AND active_token.account_id = a.account_id
+				AND active_token.revoked_at IS NULL
+		)`);
+	} else if (options.tokenStatus === 'missing') {
+		conditions.push(`NOT EXISTS (
+			SELECT 1 FROM mailbox_api_token active_token
+			WHERE active_token.user_id = a.user_id
+				AND active_token.account_id = a.account_id
+				AND active_token.revoked_at IS NULL
+		)`);
+	}
+	return { sql: conditions.join('\n AND '), bindings };
 }
 
 function normalizeAfterEmailId(value) {
@@ -279,6 +384,51 @@ function toRetrievedMessage(message, tokenRow) {
 		subject: message.subject || null,
 		receivedAt: message.createTime || null,
 		source: extracted.source
+	};
+}
+
+function safePlainText(value) {
+	if (!value) return '';
+	try {
+		return String(emailUtils.htmlToText(String(value)) || '')
+			.replace(/\s+/g, ' ')
+			.trim();
+	} catch (_) {
+		return String(value || '').replace(/\s+/g, ' ').trim();
+	}
+}
+
+/**
+ * Authenticated management response. Do not expose raw HTML: a mailbox can
+ * contain arbitrary sender-controlled markup and the management UI should
+ * render this as text. `text` is bounded while `preview` is deliberately
+ * short, enough for a list/drawer without making a single response enormous.
+ */
+function toManagedMailboxMessage(message, mailbox) {
+	const extracted = extractVerificationCode(message);
+	const plainText = String(message.text || '').slice(0, 20000);
+	const preview = safePlainText(message.text || message.content).slice(0, 500);
+	const verificationCode = extracted.code || null;
+	return {
+		emailId: Number(message.emailId),
+		accountId: mailbox.accountId,
+		email: mailbox.email,
+		from: message.sendEmail || null,
+		sendEmail: message.sendEmail || null,
+		fromName: message.name || null,
+		subject: message.subject || null,
+		text: plainText || null,
+		preview: preview || null,
+		verificationCode,
+		code: verificationCode,
+		source: extracted.source,
+		receivedAt: message.createTime || null,
+		createTime: message.createTime || null,
+		unread: Number(message.unread || 0),
+		status: Number(message.status || 0),
+		toEmail: message.toEmail || null,
+		toName: message.toName || null,
+		messageId: message.messageId || null
 	};
 }
 
@@ -587,6 +737,450 @@ const mailboxToolsService = {
 		throw new BizError('随机邮箱创建冲突，请重试', 409);
 	},
 
+	/**
+	 * One owner-scoped, paginated source of truth for the mailbox-management
+	 * screen. Active credentials are joined in a second bounded query so the
+	 * response never exposes another user's token and does not multiply account
+	 * rows when an account has replacement credentials.
+	 */
+	async listMailboxes(c, params, userId) {
+		const options = normalizeMailboxListOptions(params);
+		const filter = mailboxFilterSql(options, userId);
+		const offset = (options.page - 1) * options.pageSize;
+		const countStatement = c.env.db.prepare(`
+			SELECT COUNT(*) AS total
+			FROM account a
+			WHERE ${filter.sql}
+		`).bind(...filter.bindings);
+		const listStatement = c.env.db.prepare(`
+			SELECT
+				a.account_id AS accountId,
+				a.email,
+				a.name,
+				a.status,
+				a.create_time AS createdAt,
+				a.all_receive AS allReceive,
+				a.sort,
+				(
+					SELECT COUNT(*) FROM mailbox_api_token token_count
+					WHERE token_count.user_id = a.user_id
+						AND token_count.account_id = a.account_id
+						AND token_count.revoked_at IS NULL
+				) AS tokenCount,
+				(
+					SELECT COUNT(*) FROM email message_count
+					WHERE message_count.user_id = a.user_id
+						AND message_count.account_id = a.account_id
+						AND message_count.type = ?
+						AND message_count.is_del = ?
+				) AS messageCount,
+				(
+					SELECT COUNT(*) FROM email unread_count
+					WHERE unread_count.user_id = a.user_id
+						AND unread_count.account_id = a.account_id
+						AND unread_count.type = ?
+						AND unread_count.is_del = ?
+						AND unread_count.unread = ?
+				) AS unreadCount,
+				(
+					SELECT MAX(latest_message.email_id) FROM email latest_message
+					WHERE latest_message.user_id = a.user_id
+						AND latest_message.account_id = a.account_id
+						AND latest_message.type = ?
+						AND latest_message.is_del = ?
+				) AS latestEmailId,
+				(
+					SELECT latest_time.create_time FROM email latest_time
+					WHERE latest_time.user_id = a.user_id
+						AND latest_time.account_id = a.account_id
+						AND latest_time.type = ?
+						AND latest_time.is_del = ?
+					ORDER BY latest_time.email_id DESC
+					LIMIT 1
+				) AS latestEmailTime
+			FROM account a
+			WHERE ${filter.sql}
+			ORDER BY a.account_id DESC
+			LIMIT ? OFFSET ?
+		`).bind(
+			emailConst.type.RECEIVE,
+			isDel.NORMAL,
+			emailConst.type.RECEIVE,
+			isDel.NORMAL,
+			emailConst.unread.UNREAD,
+			emailConst.type.RECEIVE,
+			isDel.NORMAL,
+			emailConst.type.RECEIVE,
+			isDel.NORMAL,
+			...filter.bindings,
+			options.pageSize,
+			offset
+		);
+		const statsStatement = c.env.db.prepare(`
+			SELECT
+				COUNT(*) AS total,
+				COALESCE(SUM(CASE WHEN EXISTS (
+					SELECT 1 FROM mailbox_api_token stats_token
+					WHERE stats_token.user_id = a.user_id
+						AND stats_token.account_id = a.account_id
+						AND stats_token.revoked_at IS NULL
+				) THEN 1 ELSE 0 END), 0) AS withApi,
+				(
+					SELECT COUNT(*) FROM email stats_message
+					WHERE stats_message.user_id = ?
+						AND stats_message.type = ?
+						AND stats_message.is_del = ?
+						AND EXISTS (
+							SELECT 1 FROM account stats_account
+							WHERE stats_account.account_id = stats_message.account_id
+								AND stats_account.user_id = ?
+								AND stats_account.is_del = ?
+						)
+				) AS totalMessages
+			FROM account a
+			WHERE a.user_id = ? AND a.is_del = ?
+		`).bind(
+			userId,
+			emailConst.type.RECEIVE,
+			isDel.NORMAL,
+			userId,
+			isDel.NORMAL,
+			userId,
+			isDel.NORMAL
+		);
+
+		const [countResult, listResult, statsResult] = await Promise.all([
+			countStatement.first(),
+			listStatement.all(),
+			statsStatement.first()
+		]);
+		const total = Number(countResult?.total || 0);
+		const accountRows = rowsFromD1(listResult).map(row => ({
+			...row,
+			accountId: Number(row.accountId),
+			status: Number(row.status || 0),
+			allReceive: Number(row.allReceive || 0),
+			sort: Number(row.sort || 0),
+			tokenCount: Number(row.tokenCount || 0),
+			messageCount: Number(row.messageCount || 0),
+			unreadCount: Number(row.unreadCount || 0),
+			latestEmailId: row.latestEmailId == null ? null : Number(row.latestEmailId)
+		}));
+
+		const tokensByAccountId = new Map();
+		if (accountRows.length) {
+			const placeholders = accountRows.map(() => '?').join(', ');
+			const tokenResult = await c.env.db.prepare(`
+				SELECT
+					t.token_id AS id,
+					t.public_id AS publicId,
+					t.account_id AS accountId,
+					a.email,
+					t.label,
+					t.created_at AS createdAt,
+					t.last_used_at AS lastUsedAt
+				FROM mailbox_api_token t
+				INNER JOIN account a
+					ON a.account_id = t.account_id
+					AND a.user_id = t.user_id
+					AND a.is_del = ?
+				WHERE t.user_id = ?
+					AND t.revoked_at IS NULL
+					AND t.account_id IN (${placeholders})
+					AND NOT EXISTS (
+						SELECT 1 FROM mailbox_api_token newer_token
+						WHERE newer_token.user_id = t.user_id
+							AND newer_token.account_id = t.account_id
+							AND newer_token.revoked_at IS NULL
+							AND newer_token.token_id > t.token_id
+					)
+				ORDER BY t.token_id DESC
+			`).bind(isDel.NORMAL, userId, ...accountRows.map(row => row.accountId)).all();
+			const tokenRecords = await Promise.all(rowsFromD1(tokenResult).map(row => this.toTokenRecord(c, row)));
+			for (const tokenRecord of tokenRecords) {
+				const accountTokens = tokensByAccountId.get(tokenRecord.accountId) || [];
+				accountTokens.push(tokenRecord);
+				tokensByAccountId.set(tokenRecord.accountId, accountTokens);
+			}
+		}
+
+		const list = accountRows.map(row => {
+			const tokens = tokensByAccountId.get(row.accountId) || [];
+			const primaryToken = tokens[0] || null;
+			return {
+				...row,
+				hasToken: row.tokenCount > 0,
+				tokens,
+				primaryToken,
+				codeUrl: primaryToken?.codeUrl || null
+			};
+		});
+		const statsTotal = Number(statsResult?.total || 0);
+		const withApi = Number(statsResult?.withApi || 0);
+
+		return {
+			list,
+			total,
+			page: options.page,
+			pageSize: options.pageSize,
+			pageCount: total ? Math.ceil(total / options.pageSize) : 0,
+			stats: {
+				total: statsTotal,
+				withApi,
+				withoutApi: Math.max(0, statsTotal - withApi),
+				totalMessages: Number(statsResult?.totalMessages || 0)
+			},
+			domains: asDomainList(c.env.domain).map(normalizeDomain).filter(Boolean)
+		};
+	},
+
+	/**
+	 * Idempotently create one default retrieval credential for every requested
+	 * owned mailbox that currently has none. The D1 batch contains a live quota
+	 * guard and the INSERT re-checks ownership/token existence in the same
+	 * transaction, so retries and concurrent clicks cannot create duplicates.
+	 */
+	async ensureMailboxTokens(c, params, userId) {
+		const accountIds = normalizeEnsureTokenAccountIds(params);
+		const placeholders = accountIds.map(() => '?').join(', ');
+		const ownedResult = await c.env.db.prepare(`
+			SELECT account_id AS accountId, email
+			FROM account
+			WHERE user_id = ? AND is_del = ? AND account_id IN (${placeholders})
+		`).bind(userId, isDel.NORMAL, ...accountIds).all();
+		const ownedRows = rowsFromD1(ownedResult).map(row => ({
+			accountId: Number(row.accountId),
+			email: row.email
+		}));
+		if (ownedRows.length !== accountIds.length) {
+			throw new BizError('一个或多个邮箱不存在或不属于当前用户', 404);
+		}
+
+		let activeRows = await this.selectActiveTokensForAccounts(c, userId, accountIds);
+		const existingAccountIds = new Set(activeRows.map(row => Number(row.accountId)));
+		const missingRows = ownedRows.filter(row => !existingAccountIds.has(row.accountId));
+		if (missingRows.length) {
+			const activeCount = await countActiveUserTokens(c, userId);
+			if (activeCount + missingRows.length > MAX_ACTIVE_TOKENS_PER_USER) {
+				throw new BizError(`每个用户最多保留 ${MAX_ACTIVE_TOKENS_PER_USER} 个有效取件 URL`, 403);
+			}
+
+			const candidates = missingRows.map(row => ({
+				...row,
+				publicId: crypto.randomUUID()
+			}));
+			const guardValues = candidates.map(() => '(?)').join(', ');
+			const insertValues = candidates.map(() => '(?, ?)').join(', ');
+			const guard = c.env.db.prepare(`
+				WITH candidates(account_id) AS (VALUES ${guardValues})
+				INSERT INTO mailbox_api_token (public_id, user_id, account_id, label)
+				SELECT NULL, ?, 0, ?
+				WHERE (
+					SELECT COUNT(*) FROM mailbox_api_token
+					WHERE user_id = ? AND revoked_at IS NULL
+				) + (
+					SELECT COUNT(*)
+					FROM candidates candidate
+					INNER JOIN account owned
+						ON owned.account_id = candidate.account_id
+						AND owned.user_id = ?
+						AND owned.is_del = ?
+					WHERE NOT EXISTS (
+						SELECT 1 FROM mailbox_api_token active
+						WHERE active.user_id = ?
+							AND active.account_id = candidate.account_id
+							AND active.revoked_at IS NULL
+					)
+				) > ?
+			`).bind(
+				...candidates.map(row => row.accountId),
+				userId,
+				MANAGED_TOKEN_LABEL,
+				userId,
+				userId,
+				isDel.NORMAL,
+				userId,
+				MAX_ACTIVE_TOKENS_PER_USER
+			);
+			const insert = c.env.db.prepare(`
+				WITH candidates(account_id, public_id) AS (VALUES ${insertValues})
+				INSERT INTO mailbox_api_token (public_id, user_id, account_id, label)
+				SELECT candidate.public_id, ?, candidate.account_id, ?
+				FROM candidates candidate
+				INNER JOIN account owned
+					ON owned.account_id = candidate.account_id
+					AND owned.user_id = ?
+					AND owned.is_del = ?
+				WHERE NOT EXISTS (
+					SELECT 1 FROM mailbox_api_token active
+					WHERE active.user_id = ?
+						AND active.account_id = candidate.account_id
+						AND active.revoked_at IS NULL
+				)
+				RETURNING
+					token_id AS id,
+					public_id AS publicId,
+					account_id AS accountId,
+					label,
+					created_at AS createdAt,
+					last_used_at AS lastUsedAt
+			`).bind(
+				...candidates.flatMap(row => [row.accountId, row.publicId]),
+				userId,
+				MANAGED_TOKEN_LABEL,
+				userId,
+				isDel.NORMAL,
+				userId
+			);
+
+			try {
+				await c.env.db.batch([guard, insert]);
+			} catch (error) {
+				if (/not null constraint failed:\s*mailbox_api_token\.public_id|sqlite_constraint_notnull/i.test(error?.message || '')) {
+					throw new BizError('取件 URL 配额已被并发请求占用，请重试', 409);
+				}
+				throw error;
+			}
+			activeRows = await this.selectActiveTokensForAccounts(c, userId, accountIds);
+		}
+
+		const ownedById = new Map(ownedRows.map(row => [row.accountId, row]));
+		const primaryByAccountId = new Map();
+		for (const row of activeRows) {
+			const accountId = Number(row.accountId);
+			if (!primaryByAccountId.has(accountId)) primaryByAccountId.set(accountId, row);
+		}
+		const initialExistingIds = existingAccountIds;
+		const list = await Promise.all(accountIds.map(async accountId => {
+			const row = primaryByAccountId.get(accountId);
+			if (!row) throw new BizError('取件 URL 创建未完成，请重试', 409);
+			const token = await this.toTokenRecord(c, {
+				...row,
+				email: ownedById.get(accountId).email
+			});
+			return {
+				...token,
+				created: !initialExistingIds.has(accountId)
+			};
+		}));
+		const createdCount = list.filter(item => item.created).length;
+		return {
+			requestedCount: accountIds.length,
+			createdCount,
+			existingCount: accountIds.length - createdCount,
+			list
+		};
+	},
+
+	async selectActiveTokensForAccounts(c, userId, accountIds) {
+		if (!accountIds.length) return [];
+		const placeholders = accountIds.map(() => '?').join(', ');
+		const result = await c.env.db.prepare(`
+			SELECT
+				token_id AS id,
+				public_id AS publicId,
+				account_id AS accountId,
+				label,
+				created_at AS createdAt,
+				last_used_at AS lastUsedAt
+			FROM mailbox_api_token
+			WHERE user_id = ? AND revoked_at IS NULL
+				AND account_id IN (${placeholders})
+			ORDER BY token_id DESC
+		`).bind(userId, ...accountIds).all();
+		return rowsFromD1(result).map(row => ({
+			...row,
+			id: Number(row.id),
+			accountId: Number(row.accountId)
+		}));
+	},
+
+	/**
+	 * Return one owned mailbox's received mail as plain, bounded management
+	 * records. This endpoint intentionally does not depend on a retrieval token,
+	 * so mailboxes whose API has not been created can still be inspected.
+	 */
+	async managedMailboxMessages(c, accountIdValue, params, userId) {
+		const accountId = Number(accountIdValue);
+		if (!Number.isSafeInteger(accountId) || accountId < 1) {
+			throw new BizError('accountId 无效', 400);
+		}
+		const options = normalizeRetrievalOptions(params);
+		const mailbox = await c.env.db.prepare(`
+			SELECT account_id AS accountId, email, name
+			FROM account
+			WHERE account_id = ? AND user_id = ? AND is_del = ?
+		`).bind(accountId, userId, isDel.NORMAL).first();
+		if (!mailbox) throw new BizError('邮箱不存在或不属于当前用户', 404);
+
+		const cursorSql = options.mode === 'before'
+			? 'AND email_id < ?'
+			: options.mode === 'after'
+				? 'AND email_id > ?'
+				: '';
+		const cursorBindings = options.mode === 'before'
+			? [options.beforeEmailId]
+			: options.mode === 'after'
+				? [options.afterEmailId]
+				: [];
+		const order = options.mode === 'after' ? 'ASC' : 'DESC';
+		const result = await c.env.db.prepare(`
+			SELECT
+				email_id AS emailId,
+				send_email AS sendEmail,
+				name,
+				subject,
+				code,
+				text,
+				content,
+				unread,
+				status,
+				to_email AS toEmail,
+				to_name AS toName,
+				message_id AS messageId,
+				create_time AS createTime
+			FROM email
+			WHERE user_id = ?
+				AND account_id = ?
+				AND type = ?
+				AND is_del = ?
+				${cursorSql}
+			ORDER BY email_id ${order}
+			LIMIT ?
+		`).bind(
+			userId,
+			accountId,
+			emailConst.type.RECEIVE,
+			isDel.NORMAL,
+			...cursorBindings,
+			options.limit + 1
+		).all();
+		const fetched = rowsFromD1(result);
+		const hasMore = fetched.length > options.limit;
+		const pageRows = hasMore ? fetched.slice(0, options.limit) : fetched;
+		const mailboxRecord = {
+			accountId: Number(mailbox.accountId),
+			email: mailbox.email,
+			name: mailbox.name || ''
+		};
+		const messages = pageRows.map(message => toManagedMailboxMessage(message, mailboxRecord));
+		const ids = messages.map(message => Number(message.emailId)).filter(Number.isSafeInteger);
+		const newestId = ids.length ? Math.max(...ids) : (options.afterEmailId || 0);
+		const oldestId = ids.length ? Math.min(...ids) : (options.beforeEmailId || 0);
+
+		return {
+			mailbox: mailboxRecord,
+			messages,
+			list: messages,
+			count: messages.length,
+			hasMore,
+			hasOlder: options.mode === 'after' ? Boolean(options.afterEmailId) : hasMore,
+			hasNewer: options.mode === 'before' ? Boolean(options.beforeEmailId) : (options.mode === 'after' && hasMore),
+			nextBeforeEmailId: oldestId,
+			nextAfterEmailId: newestId
+		};
+	},
+
 	async listTokens(c, userId) {
 		const rows = await orm(c)
 			.select({
@@ -632,17 +1226,14 @@ const mailboxToolsService = {
 		if (!accountRow) throw new BizError('邮箱不存在或不属于当前用户', 404);
 
 		const [userTokenCount, accountTokenCount] = await Promise.all([
-			orm(c).select({ total: count() }).from(mailboxApiToken).where(and(
-				eq(mailboxApiToken.userId, userId),
-				isNull(mailboxApiToken.revokedAt)
-			)).get(),
+			countActiveUserTokens(c, userId),
 			orm(c).select({ total: count() }).from(mailboxApiToken).where(and(
 				eq(mailboxApiToken.userId, userId),
 				eq(mailboxApiToken.accountId, accountId),
 				isNull(mailboxApiToken.revokedAt)
 			)).get()
 		]);
-		if (Number(userTokenCount.total) >= MAX_ACTIVE_TOKENS_PER_USER) {
+		if (Number(userTokenCount) >= MAX_ACTIVE_TOKENS_PER_USER) {
 			throw new BizError(`每个用户最多保留 ${MAX_ACTIVE_TOKENS_PER_USER} 个有效取件 URL`, 403);
 		}
 		if (Number(accountTokenCount.total) >= MAX_ACTIVE_TOKENS_PER_ACCOUNT) {

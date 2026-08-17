@@ -31,6 +31,11 @@
           <Icon icon="fluent:mail-link-20-regular" width="21" height="21" />
           <span class="menu-name" style="margin-left: 20px">{{$t('mailboxTools')}}</span>
         </el-menu-item>
+        <el-menu-item @click="router.push({name: 'mailbox-management'})" index="mailbox-management"
+                      :class="route.meta.name === 'mailbox-management' ? 'choose-item' : ''">
+          <Icon icon="fluent:mail-inbox-all-24-regular" width="21" height="21" />
+          <span class="menu-name" style="margin-left: 20px">{{$t('mailboxManagement')}}</span>
+        </el-menu-item>
         <el-menu-item @click="router.push({name: 'setting'})" index="setting"
                       :class="route.meta.name === 'setting' ? 'choose-item' : ''">
           <Icon icon="fluent:settings-48-regular" width="20" height="20" />

@@ -21,7 +21,9 @@ export const MAILBOX_TOOLS_SCHEMA_STATEMENTS = Object.freeze([
 	`CREATE INDEX IF NOT EXISTS idx_mailbox_api_token_account_active
 		ON mailbox_api_token (user_id, account_id, revoked_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_email_mailbox_code_lookup
-		ON email (user_id, account_id, type, is_del, email_id DESC)`
+		ON email (user_id, account_id, type, is_del, email_id DESC)`,
+	`CREATE INDEX IF NOT EXISTS idx_account_mailbox_management
+		ON account (user_id, is_del, account_id DESC)`
 ]);
 
 const schemaPromises = new WeakMap();

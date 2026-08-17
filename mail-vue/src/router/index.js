@@ -61,6 +61,16 @@ const routes = [
                     menu: true
                 }
             },
+            {
+                path: '/mailbox-management',
+                name: 'mailbox-management',
+                component: () => import('@/views/mailbox-management/index.vue'),
+                meta: {
+                    title: 'mailboxManagement',
+                    name: 'mailbox-management',
+                    menu: true
+                }
+            },
         ]
 
     },
