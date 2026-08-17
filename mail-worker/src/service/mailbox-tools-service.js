@@ -1,4 +1,4 @@
-import { and, count, desc, eq, gt, isNull, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gt, isNull, lt, sql } from 'drizzle-orm';
 import BizError from '../error/biz-error';
 import { emailConst, isDel } from '../const/entity-const';
 import account from '../entity/account';
@@ -22,6 +22,8 @@ const MAX_ACTIVE_TOKENS_PER_ACCOUNT = 10;
 // existing per-mailbox limit for manually-created replacement URLs.
 const MAX_ACTIVE_TOKENS_PER_USER = MAX_MAILBOXES_PER_USER * MAX_ACTIVE_TOKENS_PER_ACCOUNT;
 const BATCH_SQL_CHUNK_SIZE = 25;
+const DEFAULT_RETRIEVAL_LIMIT = 20;
+const MAX_RETRIEVAL_LIMIT = 50;
 const AUTO_TOKEN_LABEL = 'batch-created';
 const TOKEN_PURPOSE = 'cloud-mail:mailbox-api:v1:';
 const RANDOM_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -187,6 +189,40 @@ function normalizeAfterEmailId(value) {
 	return parsed;
 }
 
+function normalizeBeforeEmailId(value) {
+	if (value === undefined || value === null || value === '') return 0;
+	const parsed = Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed < 1) {
+		throw new BizError('beforeEmailId 必须是正整数', 400);
+	}
+	return parsed;
+}
+
+function normalizeRetrievalLimit(value) {
+	if (value === undefined || value === null || value === '') return DEFAULT_RETRIEVAL_LIMIT;
+	const parsed = Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > MAX_RETRIEVAL_LIMIT) {
+		throw new BizError(`limit 必须是 1-${MAX_RETRIEVAL_LIMIT} 的整数`, 400);
+	}
+	return parsed;
+}
+
+export function normalizeRetrievalOptions(params = {}) {
+	const afterProvided = params.afterEmailId !== undefined && params.afterEmailId !== null && params.afterEmailId !== '';
+	const beforeProvided = params.beforeEmailId !== undefined && params.beforeEmailId !== null && params.beforeEmailId !== '';
+	if (afterProvided && beforeProvided) {
+		throw new BizError('afterEmailId 与 beforeEmailId 不能同时使用', 400);
+	}
+	return {
+		afterEmailId: normalizeAfterEmailId(params.afterEmailId),
+		beforeEmailId: normalizeBeforeEmailId(params.beforeEmailId),
+		limit: normalizeRetrievalLimit(params.limit),
+		// `afterEmailId` is a queue read (oldest unseen first); `beforeEmailId`
+		// and cursor-less calls are latest/history reads (newest first).
+		mode: afterProvided ? 'after' : (beforeProvided ? 'before' : 'latest')
+	};
+}
+
 function storedCode(value) {
 	const code = String(value || '').trim();
 	if (!code || code.length > 64 || /[\r\n]/.test(code)) return '';
@@ -222,8 +258,84 @@ export function extractVerificationCode(row) {
 		}
 	}
 
-	const numeric = searchable.match(/(?:^|\D)(\d{4,8})(?!\d)/u);
+	// Do not treat a numeric run embedded in a UUID, message ID or another
+	// alphanumeric identifier as an OTP. This used to turn values such as
+	// `aaf1a61f176debd019925001747b0723` into a false verification code.
+	const numeric = searchable.match(/(?:^|[^A-Z0-9])(\d{4,8})(?![A-Z0-9])/iu);
 	return numeric ? { code: numeric[1], source: 'parsed' } : { code: '', source: null };
+}
+
+function toRetrievedMessage(message, tokenRow) {
+	const extracted = extractVerificationCode(message);
+	const verificationCode = extracted.code || null;
+	return {
+		found: Boolean(verificationCode),
+		email: tokenRow.email,
+		accountId: tokenRow.accountId,
+		code: verificationCode,
+		verificationCode,
+		emailId: message.emailId,
+		from: message.sendEmail || null,
+		subject: message.subject || null,
+		receivedAt: message.createTime || null,
+		source: extracted.source
+	};
+}
+
+/**
+ * Keep the original single-message fields for existing clients while also
+ * returning every fetched message. `messages` is the queue clients should
+ * process before advancing to `nextAfterEmailId`.
+ */
+export function buildRetrievalResult(messages, tokenRow, options = {}) {
+	const {
+		afterEmailId = 0,
+		beforeEmailId = 0,
+		hasMore = false,
+		mode = 'latest'
+	} = options;
+	const queueMode = mode === 'after';
+	const items = messages.map(message => toRetrievedMessage(message, tokenRow));
+	const newest = items.reduce((current, item) => (
+		!current || Number(item.emailId) > Number(current.emailId) ? item : current
+	), null);
+	const oldest = items.reduce((current, item) => (
+		!current || Number(item.emailId) < Number(current.emailId) ? item : current
+	), null);
+	const matched = items.filter(item => item.found);
+	const selected = queueMode
+		? (matched[0] || null)
+		: matched.reduce((current, item) => (
+			!current || Number(item.emailId) > Number(current.emailId) ? item : current
+		), null);
+	// `nextAfterEmailId` is the batch cursor for array-aware consumers. Keep
+	// `latestEmailId` on the selected code in queue mode so older single-code
+	// clients can continue one message at a time without skipping later codes.
+	const nextAfterEmailId = newest?.emailId || afterEmailId;
+	const nextBeforeEmailId = oldest?.emailId || beforeEmailId;
+	const legacyCursor = (queueMode ? selected?.emailId : nextAfterEmailId)
+		|| nextAfterEmailId;
+
+	return {
+		found: Boolean(selected),
+		email: tokenRow.email,
+		accountId: tokenRow.accountId,
+		code: selected?.code || null,
+		emailId: selected?.emailId || null,
+		latestEmailId: legacyCursor,
+		nextAfterEmailId,
+		nextBeforeEmailId,
+		codeCursor: legacyCursor,
+		from: selected?.from || null,
+		subject: selected?.subject || null,
+		receivedAt: selected?.receivedAt || null,
+		source: selected?.source || null,
+		count: items.length,
+		hasMore: Boolean(hasMore),
+		hasOlder: mode !== 'after' && Boolean(hasMore),
+		hasNewer: mode === 'after' && Boolean(hasMore),
+		messages: items
+	};
 }
 
 const mailboxToolsService = {
@@ -583,7 +695,7 @@ const mailboxToolsService = {
 		if (!Number.isSafeInteger(tokenId) || tokenId < 1) throw new BizError('tokenId 无效', 400);
 		const tokenRow = await this.selectOwnedActiveToken(c, tokenId, userId);
 		if (!tokenRow) throw new BizError('取件 URL 不存在或已撤销', 404);
-		return this.retrieveForToken(c, tokenRow, normalizeAfterEmailId(params.afterEmailId));
+		return this.retrieveForToken(c, tokenRow, normalizeRetrievalOptions(params));
 	},
 
 	async retrievePublic(c, credential, params = {}) {
@@ -610,7 +722,7 @@ const mailboxToolsService = {
 			.get();
 		if (!tokenRow) throw new BizError('取件 URL 无效或已撤销', 401);
 
-		return this.retrieveForToken(c, tokenRow, normalizeAfterEmailId(params.afterEmailId));
+		return this.retrieveForToken(c, tokenRow, normalizeRetrievalOptions(params));
 	},
 
 	async selectOwnedActiveToken(c, tokenId, userId) {
@@ -635,8 +747,18 @@ const mailboxToolsService = {
 			.get();
 	},
 
-	async retrieveForToken(c, tokenRow, afterEmailId) {
-		const messages = await orm(c)
+	async retrieveForToken(c, tokenRow, options = {}) {
+		const {
+			afterEmailId = 0,
+			beforeEmailId = 0,
+			limit = DEFAULT_RETRIEVAL_LIMIT,
+			mode = 'latest'
+		} = options;
+		const ascending = mode === 'after';
+		const cursorCondition = mode === 'before'
+			? lt(email.emailId, beforeEmailId)
+			: gt(email.emailId, afterEmailId);
+		const fetchedMessages = await orm(c)
 			.select({
 				emailId: email.emailId,
 				code: email.code,
@@ -652,11 +774,13 @@ const mailboxToolsService = {
 				eq(email.userId, tokenRow.userId),
 				eq(email.type, emailConst.type.RECEIVE),
 				eq(email.isDel, isDel.NORMAL),
-				gt(email.emailId, afterEmailId)
+				cursorCondition
 			))
-			.orderBy(desc(email.emailId))
-			.limit(25)
+			.orderBy(ascending ? asc(email.emailId) : desc(email.emailId))
+			.limit(limit + 1)
 			.all();
+		const hasMore = fetchedMessages.length > limit;
+		const messages = hasMore ? fetchedMessages.slice(0, limit) : fetchedMessages;
 
 		// Retrieval URLs are commonly polled every few seconds. Keep useful
 		// activity metadata without turning every read into a D1 write.
@@ -665,29 +789,12 @@ const mailboxToolsService = {
 			.bind(tokenRow.id)
 			.run();
 
-		let selected = null;
-		let extracted = { code: '', source: null };
-		for (const message of messages) {
-			const candidate = extractVerificationCode(message);
-			if (!candidate.code) continue;
-			selected = message;
-			extracted = candidate;
-			break;
-		}
-
-		const newest = messages[0] || null;
-		return {
-			found: Boolean(extracted.code),
-			email: tokenRow.email,
-			accountId: tokenRow.accountId,
-			code: extracted.code || null,
-			emailId: selected?.emailId || null,
-			latestEmailId: newest?.emailId || afterEmailId,
-			from: selected?.sendEmail || null,
-			subject: selected?.subject || null,
-			receivedAt: selected?.createTime || null,
-			source: extracted.source
-		};
+		return buildRetrievalResult(messages, tokenRow, {
+			afterEmailId,
+			beforeEmailId,
+			hasMore,
+			mode
+		});
 	},
 
 	async toTokenRecord(c, row) {

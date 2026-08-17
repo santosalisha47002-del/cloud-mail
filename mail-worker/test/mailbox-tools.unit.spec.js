@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import mailboxToolsService, { extractVerificationCode, MAILBOX_LAST_USED_TOUCH_SQL } from '../src/service/mailbox-tools-service';
+import mailboxToolsService, {
+	buildRetrievalResult,
+	extractVerificationCode,
+	MAILBOX_LAST_USED_TOUCH_SQL,
+	normalizeRetrievalOptions
+} from '../src/service/mailbox-tools-service';
 import { isMailboxCodeCredential, isPublicMailboxCodeRequest } from '../src/security/mailbox-code-route';
 import { ensureMailboxToolsSchema, MAILBOX_TOOLS_SCHEMA_STATEMENTS } from '../src/init/mailbox-tools-schema';
 import { toPublicCodeResult } from '../src/api/mailbox-tools-api';
@@ -119,6 +124,79 @@ describe('verification-code extraction', () => {
 		});
 		expect(extractVerificationCode({ subject: 'Welcome', text: 'Thanks for signing up.' })).toEqual({ code: '', source: null });
 	});
+
+	it('does not mistake digits embedded in a message id for a verification code', () => {
+		expect(extractVerificationCode({
+			subject: 'SendTestEmail.com - Testing Email ID: aaf1a61f176debd019925001747b0723',
+			text: 'If you are reading this your email address is working.'
+		})).toEqual({ code: '', source: null });
+	});
+
+	it('returns all fetched messages and advances a cursor one code at a time', () => {
+		const tokenRow = { email: 'verify@salvadawn.com', accountId: 758 };
+		const messages = [
+			{ emailId: 707, code: '111111', sendEmail: 'a@example.net', subject: 'First', createTime: '2026-08-17 10:00:00' },
+			{ emailId: 708, code: '222222', sendEmail: 'b@example.net', subject: 'Second', createTime: '2026-08-17 10:01:00' },
+			{ emailId: 709, code: '', sendEmail: 'c@example.net', subject: 'Notice', text: 'No code', createTime: '2026-08-17 10:02:00' }
+		];
+		const result = buildRetrievalResult(messages, tokenRow, { afterEmailId: 706, mode: 'after' });
+		expect(result.count).toBe(3);
+		expect(result.messages.map(item => item.emailId)).toEqual([707, 708, 709]);
+		expect(result.messages.map(item => item.verificationCode)).toEqual(['111111', '222222', null]);
+		expect(result.code).toBe('111111');
+		expect(result.latestEmailId).toBe(707);
+		expect(result.nextAfterEmailId).toBe(709);
+		expect(result.nextBeforeEmailId).toBe(707);
+		expect(result.codeCursor).toBe(707);
+		expect(result.hasNewer).toBe(false);
+	});
+});
+
+describe('retrieval pagination metadata', () => {
+	it('distinguishes latest, newer queue, and older history reads', () => {
+		expect(normalizeRetrievalOptions({ limit: '50' })).toEqual({
+			afterEmailId: 0,
+			beforeEmailId: 0,
+			limit: 50,
+			mode: 'latest'
+		});
+		expect(normalizeRetrievalOptions({ afterEmailId: '0', limit: '1' }).mode).toBe('after');
+		expect(normalizeRetrievalOptions({ beforeEmailId: '708' }).mode).toBe('before');
+		expect(() => normalizeRetrievalOptions({ afterEmailId: 10, beforeEmailId: 20 })).toThrow(/不能同时使用/);
+		expect(() => normalizeRetrievalOptions({ limit: 51 })).toThrow(/1-50/);
+	});
+
+	it('provides a backward cursor when the latest page has older mail', () => {
+		const tokenRow = { email: 'verify@salvadawn.com', accountId: 758 };
+		const result = buildRetrievalResult([
+			{ emailId: 709, code: '', subject: 'Notice', text: 'No code' },
+			{ emailId: 708, code: '222222', subject: 'Second' },
+			{ emailId: 707, code: '111111', subject: 'First' }
+		], tokenRow, { hasMore: true, mode: 'latest' });
+
+		expect(result.code).toBe('222222');
+		expect(result.latestEmailId).toBe(709);
+		expect(result.nextAfterEmailId).toBe(709);
+		expect(result.nextBeforeEmailId).toBe(707);
+		expect(result.hasMore).toBe(true);
+		expect(result.hasOlder).toBe(true);
+		expect(result.hasNewer).toBe(false);
+	});
+
+	it('advances a code cursor across code-less queue pages', () => {
+		const result = buildRetrievalResult([
+			{ emailId: 710, code: '', subject: 'Notice', text: 'No code' }
+		], { email: 'verify@salvadawn.com', accountId: 758 }, {
+			afterEmailId: 709,
+			hasMore: true,
+			mode: 'after'
+		});
+
+		expect(result.found).toBe(false);
+		expect(result.latestEmailId).toBe(710);
+		expect(result.codeCursor).toBe(710);
+		expect(result.hasNewer).toBe(true);
+	});
 });
 
 describe('public retrieval authentication boundary', () => {
@@ -146,6 +224,29 @@ describe('public retrieval authentication boundary', () => {
 			latestEmailId: 703,
 			subject: '登录验证码'
 		});
+	});
+
+	it('preserves a multi-message history in the public response', () => {
+		const result = toPublicCodeResult({
+			found: true,
+			email: 'verify@salvadawn.com',
+			accountId: 758,
+			code: '222222',
+			latestEmailId: 708,
+			nextAfterEmailId: 708,
+			nextBeforeEmailId: 707,
+			count: 2,
+			messages: [
+				{emailId: 707, found: true, code: '111111', subject: 'First'},
+				{emailId: 708, found: true, code: '222222', subject: 'Second'}
+			]
+		});
+		expect(result.count).toBe(2);
+		expect(result.messages).toHaveLength(2);
+		expect(result.messages[1]).toMatchObject({ email: 'verify@salvadawn.com', verificationCode: '222222' });
+		expect(result.nextAfterEmailId).toBe(708);
+		expect(result.nextBeforeEmailId).toBe(707);
+		expect(result.codeCursor).toBe(708);
 	});
 });
 

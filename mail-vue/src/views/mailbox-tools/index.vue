@@ -302,8 +302,22 @@
     "found": true,
     "email": "verify@salvadawn.com",
     "code": "123456",
+    "verificationCode": "123456",
+    "emailId": 708,
+    "latestEmailId": 708,
     "subject": "Your verification code",
-    "receivedAt": "2026-08-17T03:12:00.000Z"
+    "receivedAt": "2026-08-17T03:12:00.000Z",
+    "count": 2,
+    "hasMore": false,
+    "hasOlder": false,
+    "hasNewer": false,
+    "nextAfterEmailId": 708,
+    "nextBeforeEmailId": 707,
+    "codeCursor": 708,
+    "messages": [
+      {"emailId": 708, "verificationCode": "123456"},
+      {"emailId": 707, "verificationCode": "654321"}
+    ]
   }
 }</code></pre>
         </section>
@@ -325,6 +339,20 @@
               :closable="false"
               show-icon
           />
+          <div v-if="testDialog.messages.length" class="message-history">
+            <div class="history-summary">{{ $t('receivedMessageCount', {count: testDialog.messageCount}) }}</div>
+            <article v-for="message in testDialog.messages" :key="message.emailId" class="history-item">
+              <div class="history-item-main">
+                <strong v-if="message.verificationCode" class="history-code">{{ message.verificationCode }}</strong>
+                <span v-else class="history-no-code">{{ $t('messageWithoutCode') }}</span>
+                <span class="history-subject">{{ message.subject || '—' }}</span>
+              </div>
+              <small>
+                {{ $t('messageIdLabel') }} {{ message.emailId || '—' }}
+                <span v-if="message.from"> · {{ message.from }}</span>
+              </small>
+            </article>
+          </div>
           <div v-if="testDialog.subject" class="test-meta">
             <span>{{ $t('subject') }}</span>
             <strong>{{ testDialog.subject }}</strong>
@@ -383,6 +411,8 @@ const testDialog = reactive({
   loading: false,
   ok: false,
   verificationCode: '',
+  messages: [],
+  messageCount: 0,
   subject: '',
   message: '',
   raw: ''
@@ -607,6 +637,8 @@ async function testToken(token) {
   testDialog.loading = true
   testDialog.ok = false
   testDialog.verificationCode = ''
+  testDialog.messages = []
+  testDialog.messageCount = 0
   testDialog.subject = ''
   testDialog.message = ''
   testDialog.raw = ''
@@ -629,6 +661,8 @@ async function testToken(token) {
     const result = normalizeCodeResult(payload)
     testDialog.ok = response.ok
     testDialog.verificationCode = result.verificationCode
+    testDialog.messages = result.messages
+    testDialog.messageCount = result.count
     testDialog.subject = result.subject
     testDialog.message = response.ok
         ? (result.found ? t('fetchSuccess') : t('noCodeYet'))
@@ -645,14 +679,23 @@ async function testToken(token) {
 function normalizeCodeResult(payload) {
   const body = payload && typeof payload === 'object' && 'data' in payload ? payload.data : payload
   if (typeof body === 'string' || typeof body === 'number') {
-    return {found: Boolean(body), verificationCode: String(body || ''), subject: '', message: ''}
+    return {found: Boolean(body), verificationCode: String(body || ''), subject: '', message: '', messages: [], count: 0}
   }
   const verificationCode = String(body?.verificationCode || body?.code || body?.otp || body?.captcha || '')
+  const messages = Array.isArray(body?.messages) ? body.messages.map(message => ({
+    ...message,
+    verificationCode: String(message?.verificationCode || message?.code || ''),
+    subject: message?.subject || '',
+    from: message?.from || '',
+    emailId: message?.emailId || ''
+  })) : []
   return {
     found: typeof body?.found === 'boolean' ? body.found : Boolean(verificationCode),
     verificationCode,
     subject: body?.subject || body?.emailSubject || '',
-    message: body?.message || payload?.message || ''
+    message: body?.message || payload?.message || '',
+    messages,
+    count: Number.isSafeInteger(Number(body?.count)) ? Number(body.count) : messages.length
   }
 }
 
@@ -1247,6 +1290,59 @@ function downloadCsv() {
 
 .test-meta strong {
   color: var(--el-text-color-primary);
+}
+
+.message-history {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.history-summary {
+  color: var(--secondary-text-color);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.history-item {
+  display: grid;
+  gap: 4px;
+  padding: 9px 11px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  background: var(--extra-light-fill);
+}
+
+.history-item-main {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  min-width: 0;
+}
+
+.history-code {
+  flex: 0 0 auto;
+  color: var(--el-color-success);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  letter-spacing: .05em;
+}
+
+.history-no-code {
+  flex: 0 0 auto;
+  color: var(--secondary-text-color);
+  font-size: 11px;
+}
+
+.history-subject {
+  overflow: hidden;
+  color: var(--el-text-color-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-item small {
+  color: var(--secondary-text-color);
+  font-size: 10px;
 }
 
 .raw-result {

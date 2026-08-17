@@ -4,7 +4,7 @@ The **Mailbox Tools** page at `/mailbox-tools` can create receiving aliases in
 batches and issue a revocable retrieval URL for each mailbox. Aliases share the
 current Cloud Mail login; they are not separate users.
 
-## Retrieve the latest verification code
+## Retrieve verification codes and message history
 
 Call the generated URL without a login token:
 
@@ -29,24 +29,76 @@ Response:
     "from": "otp@example.net",
     "subject": "Your verification code",
     "receivedAt": "2026-08-17 12:30:00",
-    "source": "stored"
+    "source": "stored",
+    "count": 1,
+    "nextAfterEmailId": 704,
+    "nextBeforeEmailId": 704,
+    "codeCursor": 704,
+    "hasMore": false,
+    "hasOlder": false,
+    "hasNewer": false,
+    "messages": [
+      {
+        "found": true,
+        "email": "inbox@salvadawn.com",
+        "accountId": 705,
+        "code": "482731",
+        "verificationCode": "482731",
+        "emailId": 704,
+        "from": "otp@example.net",
+        "subject": "Your verification code",
+        "receivedAt": "2026-08-17 12:30:00",
+        "source": "stored"
+      }
+    ]
   }
 }
 ```
 
-When no matching message is available, `data.found` is `false` and both code
-fields are `null`.
+`data.messages` contains every fetched message (up to 20 by default), not just
+the newest one. Each entry includes `found`, `code`, `emailId`, subject, sender,
+and receive time. `data.count` is the number returned. The legacy top-level
+fields remain for clients that only need one code.
+
+Use `limit=1..50` to control the batch size:
+
+```bash
+curl -sS 'https://mail.salvadawn.com/api/mailbox-tools/code/<credential>?limit=50'
+```
+
+When no message is available, `data.found` is `false`, both top-level code
+fields are `null`, and `data.messages` is an empty array.
+
+## Page through older history
+
+The first cursor-less call returns the latest batch in newest-first order. If
+`hasOlder` is true, pass `nextBeforeEmailId` to retrieve the next older batch:
+
+```bash
+curl -sS 'https://mail.salvadawn.com/api/mailbox-tools/code/<credential>?beforeEmailId=704&limit=20'
+```
+
+Repeat while `hasOlder` (and the generic `hasMore`) is true. The query uses a
+strictly smaller ID, so adjacent pages do not overlap.
 
 ## Poll only newer mail
 
-Pass the last processed `latestEmailId` as a cursor:
+Pass the last processed `nextAfterEmailId` (or `latestEmailId`) as a cursor:
 
 ```bash
 curl -sS 'https://mail.salvadawn.com/api/mailbox-tools/code/<credential>?afterEmailId=704'
 ```
 
-The next response contains only mail with a larger ID. Save the returned
-`latestEmailId` for the following call.
+The next response contains only mail with a larger ID, in oldest-first order,
+and includes all messages in that batch. Array-aware consumers should save
+`nextAfterEmailId` and call again until `hasNewer` (and the generic `hasMore`)
+is false.
+
+Older clients that read only the top-level `code` should save `latestEmailId`,
+also exposed as `codeCursor`. On `afterEmailId` queue reads these fields advance
+one matching code at a time, while `nextAfterEmailId` advances across the whole
+returned batch. This prevents single-code pollers from skipping a second code
+when multiple messages arrive between polls.
 
 ## Authenticated management endpoints
 
