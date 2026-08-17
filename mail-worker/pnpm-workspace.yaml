@@ -1,0 +1,16 @@
+onlyBuiltDependencies:
+  - '@parcel/watcher'
+  - esbuild
+  - sharp
+  - vue-demi
+  - workerd
+
+# pnpm 11 renamed onlyBuiltDependencies to allowBuilds. Keeping both keys
+# lets Cloudflare's pnpm 10 builder and local pnpm 11 installs approve the
+# native packages required by Wrangler/Vite without an interactive prompt.
+allowBuilds:
+  '@parcel/watcher': true
+  esbuild: true
+  sharp: true
+  vue-demi: true
+  workerd: true
