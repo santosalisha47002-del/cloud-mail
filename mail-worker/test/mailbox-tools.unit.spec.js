@@ -7,7 +7,13 @@ import mailboxToolsService, {
 } from '../src/service/mailbox-tools-service';
 import { isMailboxCodeCredential, isPublicMailboxCodeRequest } from '../src/security/mailbox-code-route';
 import { ensureMailboxToolsSchema, MAILBOX_TOOLS_SCHEMA_STATEMENTS } from '../src/init/mailbox-tools-schema';
-import { toPublicCodeResult } from '../src/api/mailbox-tools-api';
+import {
+	canonicalPublicRequestUrl,
+	renderPublicMailboxErrorHtml,
+	renderPublicMailboxHtml,
+	shouldRenderPublicMailboxHtml,
+	toPublicCodeResult
+} from '../src/api/mailbox-tools-api';
 import accountService from '../src/service/account-service';
 import roleService from '../src/service/role-service';
 import settingService from '../src/service/setting-service';
@@ -200,6 +206,49 @@ describe('retrieval pagination metadata', () => {
 });
 
 describe('public retrieval authentication boundary', () => {
+	it('uses HTML for browser navigation while preserving JSON negotiation', () => {
+		expect(shouldRenderPublicMailboxHtml('text/html,application/xhtml+xml', '')).toBe(true);
+		expect(shouldRenderPublicMailboxHtml('*/*', '')).toBe(false);
+		expect(shouldRenderPublicMailboxHtml('application/json,text/html', 'json')).toBe(false);
+		expect(shouldRenderPublicMailboxHtml('application/json', 'html')).toBe(true);
+		expect(shouldRenderPublicMailboxHtml('*/*', '', 'navigate', 'document')).toBe(true);
+		expect(canonicalPublicRequestUrl('https://mail.salvadawn.com/mailbox-tools/code/id.sig?limit=5'))
+			.toBe('https://mail.salvadawn.com/api/mailbox-tools/code/id.sig?limit=5');
+	});
+
+	it('renders a readable mailbox page with copy controls and escaped message data', () => {
+		const html = renderPublicMailboxHtml({
+			email: 'verify@example.com',
+			found: true,
+			code: '836204',
+			verificationCode: '836204',
+			count: 1,
+			messages: [{
+				email: 'verify@example.com',
+				emailId: 42,
+				verificationCode: '836204',
+				subject: '<script>alert(1)</script>',
+				from: 'sender@example.com',
+				receivedAt: '2026-08-17 12:00:00'
+			}]
+		}, 'https://mail.salvadawn.com/api/mailbox-tools/code/id.sig?limit=20');
+
+		expect(html).toContain('复制取件 URL');
+		expect(html).toContain('复制验证码');
+		expect(html).toContain('查看 JSON');
+		expect(html).toContain('verify@example.com');
+		expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+		expect(html).not.toContain('<script>alert(1)</script>');
+		expect(html).toContain('format=json');
+	});
+
+	it('renders an escaped browser-friendly error page', () => {
+		const html = renderPublicMailboxErrorHtml('<bad token>', 401, 'https://mail.salvadawn.com/api/mailbox-tools/code/id.sig');
+		expect(html).toContain('401');
+		expect(html).toContain('&lt;bad token&gt;');
+		expect(html).not.toContain('<bad token>');
+	});
+
 	it('only exempts an exact, well-formed GET code URL', () => {
 		expect(isMailboxCodeCredential(credential)).toBe(true);
 		expect(isPublicMailboxCodeRequest(`/mailbox-tools/code/${credential}`, 'GET')).toBe(true);

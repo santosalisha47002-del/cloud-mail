@@ -4,12 +4,28 @@ The **Mailbox Tools** page at `/mailbox-tools` can create receiving aliases in
 batches and issue a revocable retrieval URL for each mailbox. Aliases share the
 current Cloud Mail login; they are not separate users.
 
+The mailbox and active-URL lists support email/label/URL filtering, domain
+filtering, page sizes of 10/20/50/100, selection across pages, and bulk copy or
+CSV export. Bulk exports contain exactly two columns: `email` and
+`retrievalUrl`; copied rows use the same fields separated by a tab.
+
 ## Retrieve verification codes and message history
 
 Call the generated URL without a login token:
 
 ```bash
 curl -sS 'https://mail.salvadawn.com/api/mailbox-tools/code/<credential>'
+```
+
+When the URL is opened directly in a browser, Cloud Mail detects the browser's
+`Accept: text/html` request and renders a readable mailbox page with the
+address, subject, sender, received time, verification code, and copy buttons.
+The JSON API remains available for programs; append `?format=json` when a
+client needs to force JSON, or send `Accept: application/json`.
+
+```text
+Browser page: https://mail.salvadawn.com/api/mailbox-tools/code/<credential>?format=html
+JSON response: https://mail.salvadawn.com/api/mailbox-tools/code/<credential>?format=json
 ```
 
 Response:
