@@ -976,8 +976,13 @@ const mailboxToolsService = {
 				INSERT INTO mailbox_api_token (public_id, user_id, account_id, label)
 				SELECT NULL, ?, 0, ?
 				WHERE (
-					SELECT COUNT(*) FROM mailbox_api_token
-					WHERE user_id = ? AND revoked_at IS NULL
+					SELECT COUNT(*)
+					FROM mailbox_api_token quota_token
+					INNER JOIN account quota_account
+						ON quota_account.account_id = quota_token.account_id
+						AND quota_account.user_id = quota_token.user_id
+						AND quota_account.is_del = ?
+					WHERE quota_token.user_id = ? AND quota_token.revoked_at IS NULL
 				) + (
 					SELECT COUNT(*)
 					FROM candidates candidate
@@ -996,6 +1001,7 @@ const mailboxToolsService = {
 				...candidates.map(row => row.accountId),
 				userId,
 				MANAGED_TOKEN_LABEL,
+				isDel.NORMAL,
 				userId,
 				userId,
 				isDel.NORMAL,

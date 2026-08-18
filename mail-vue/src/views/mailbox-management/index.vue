@@ -53,6 +53,15 @@
                 <Icon icon="fluent:checkbox-multiple-20-regular" width="17" height="17"/>
                 {{ tr('selectAllFiltered') }}
               </el-button>
+              <el-button
+                  v-if="inventoryStats.withoutApi"
+                  :loading="ensuringTokens"
+                  :disabled="!total"
+                  @click="ensureAllFilteredApis"
+              >
+                <Icon icon="fluent:link-add-24-regular" width="17" height="17"/>
+                {{ tr('createAllApis') }}
+              </el-button>
               <el-button :loading="bulkWorking" :disabled="!total" @click="copyAllFiltered">
                 <Icon icon="fluent-color:clipboard-24" width="17" height="17"/>
                 {{ tr('copyAllFiltered') }}
@@ -339,7 +348,8 @@ const translations = {
     inventory: '所有邮箱', inventoryDesc: '筛选、选择并导出邮箱和专属取件 URL', selectAllFiltered: '选择全部筛选结果',
     clearSelection: '清空选择', searchPlaceholder: '搜索邮箱、备注或 Account ID', allDomains: '全部域名',
     allStatus: '全部状态', apiReady: '已有 API', apiMissing: '缺少 API', search: '查询',
-    selectedCount: '已选择 {count} 个邮箱', selectedMissing: '其中 {count} 个缺少 API', createMissingApis: '补齐选中 API',
+    selectedCount: '已选择 {count} 个邮箱', selectedMissing: '其中 {count} 个缺少 API', createMissingApis: '补齐选中 API', createAllApis: '补齐全部筛选 API',
+    confirmCreateApis: '将为 {count} 个邮箱创建取件 API，继续吗？',
     copyAllFiltered: '复制全部筛选', exportAllFiltered: '导出全部筛选',
     copySelectedApi: '复制邮箱 + API', exportSelected: '导出 CSV', mailbox: '邮箱', messages: '邮件', latestMail: '最新邮件',
     retrievalApi: '取件 API', actions: '操作', available: '可用', apiCount: '{count} 个 URL', notCreated: '未创建',
@@ -357,7 +367,8 @@ const translations = {
     inventory: 'All Mailboxes', inventoryDesc: 'Filter, select, and export addresses with their private retrieval URLs', selectAllFiltered: 'Select all filtered',
     clearSelection: 'Clear selection', searchPlaceholder: 'Search email, label, or Account ID', allDomains: 'All domains',
     allStatus: 'All statuses', apiReady: 'API ready', apiMissing: 'API missing', search: 'Search',
-    selectedCount: '{count} mailboxes selected', selectedMissing: '{count} are missing an API', createMissingApis: 'Create missing APIs',
+    selectedCount: '{count} mailboxes selected', selectedMissing: '{count} are missing an API', createMissingApis: 'Create missing APIs', createAllApis: 'Create all missing APIs',
+    confirmCreateApis: 'Create retrieval APIs for {count} mailboxes?',
     copyAllFiltered: 'Copy all filtered', exportAllFiltered: 'Export all filtered',
     copySelectedApi: 'Copy email + API', exportSelected: 'Export CSV', mailbox: 'Mailbox', messages: 'Messages', latestMail: 'Latest mail',
     retrievalApi: 'Retrieval API', actions: 'Actions', available: 'Available', apiCount: '{count} URLs', notCreated: 'Not created',
@@ -523,6 +534,15 @@ async function selectAllFiltered() {
 async function ensureRowApi(row) {
   const accountId = Number(row.accountId)
   if (!accountId || rowCreatingIds.has(accountId)) return
+  try {
+    await ElMessageBox.confirm(tr('confirmCreateApis', {count: 1}), tr('createMissingApis'), {
+      confirmButtonText: locale.value.startsWith('zh') ? '继续' : 'Continue',
+      cancelButtonText: locale.value.startsWith('zh') ? '取消' : 'Cancel',
+      type: 'warning'
+    })
+  } catch (_) {
+    return
+  }
   rowCreatingIds.add(accountId)
   try {
     await ensureManagedMailboxTokens([accountId])
@@ -536,6 +556,15 @@ async function ensureRowApi(row) {
 async function ensureSelectedApis() {
   const ids = selectedList.value.filter(row => !row.codeUrl).map(row => Number(row.accountId)).filter(Boolean)
   if (!ids.length || ensuringTokens.value) return
+  try {
+    await ElMessageBox.confirm(tr('confirmCreateApis', {count: ids.length}), tr('createMissingApis'), {
+      confirmButtonText: locale.value.startsWith('zh') ? '继续' : 'Continue',
+      cancelButtonText: locale.value.startsWith('zh') ? '取消' : 'Cancel',
+      type: 'warning'
+    })
+  } catch (_) {
+    return
+  }
   ensuringTokens.value = true
   let created = 0
   try {
@@ -544,6 +573,43 @@ async function ensureSelectedApis() {
       created += Number(result?.createdCount) || 0
       const changed = result?.list || result?.items || []
       changed.map(normalizeMailbox).forEach(row => {
+        const previous = selectedRows.get(row.accountId) || {}
+        selectedRows.set(row.accountId, {...previous, ...row})
+      })
+    }
+    await loadRows()
+    ElMessage.success(tr('createdApis', {count: created}))
+  } finally {
+    ensuringTokens.value = false
+  }
+}
+
+async function ensureAllFilteredApis() {
+  if (ensuringTokens.value || !total.value) return
+  ensuringTokens.value = true
+  try {
+    const all = await fetchAllFilteredRows()
+    const ids = all.filter(row => !row.codeUrl).map(row => Number(row.accountId)).filter(Boolean)
+    if (!ids.length) {
+      ElMessage.info(tr('apiStillMissing', {count: 0}))
+      return
+    }
+    try {
+      await ElMessageBox.confirm(tr('confirmCreateApis', {count: ids.length}), tr('createAllApis'), {
+        confirmButtonText: locale.value.startsWith('zh') ? '继续' : 'Continue',
+        cancelButtonText: locale.value.startsWith('zh') ? '取消' : 'Cancel',
+        type: 'warning'
+      })
+    } catch (_) {
+      return
+    }
+    let created = 0
+    for (let index = 0; index < ids.length; index += 100) {
+      const result = await ensureManagedMailboxTokens(ids.slice(index, index + 100))
+      created += Number(result?.createdCount) || 0
+      const changed = result?.list || result?.items || []
+      changed.map(normalizeMailbox).forEach(row => {
+        if (!selectedRows.has(row.accountId)) return
         const previous = selectedRows.get(row.accountId) || {}
         selectedRows.set(row.accountId, {...previous, ...row})
       })

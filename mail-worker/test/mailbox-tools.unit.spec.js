@@ -258,6 +258,89 @@ describe('mailbox management inventory', () => {
 		await expect(mailboxToolsService.managedMailboxMessages({env: {db}}, 707, {}, 20))
 			.rejects.toThrow(/不存在或不属于当前用户/);
 	});
+
+	it('creates an owned missing token atomically and returns its signed URL', async () => {
+		let activeLookupCount = 0;
+		const prepared = [];
+		const db = {
+			prepare(sql) {
+				const statement = {
+					sql,
+					bindings: [],
+					bind(...bindings) {
+						expect(bindings).toHaveLength((sql.match(/\?/g) || []).length);
+						this.bindings = bindings;
+						return this;
+					},
+					async first() {
+						if (/COUNT\(\*\) AS total/i.test(sql)) return {total: 0};
+						return null;
+					},
+					async all() {
+						if (/FROM account/i.test(sql)) return {results: [{accountId: 707, email: 'verify@salvadawn.com'}]};
+						if (/FROM mailbox_api_token/i.test(sql)) {
+							activeLookupCount++;
+							return activeLookupCount === 1 ? {results: []} : {results: [{
+								id: 99,
+								publicId: '123e4567-e89b-42d3-a456-426614174000',
+								accountId: 707,
+								label: 'mailbox-management',
+								createdAt: '2026-08-17 12:00:00'
+							}]};
+						}
+						return {results: []};
+					}
+				};
+				prepared.push(statement);
+				return statement;
+			},
+			async batch(statements) {
+				expect(statements).toHaveLength(2);
+				expect(statements[0].sql).toMatch(/SELECT NULL/);
+				expect(statements[0].sql).toMatch(
+					/FROM mailbox_api_token quota_token[\s\S]+INNER JOIN account quota_account[\s\S]+quota_account\.is_del = \?[\s\S]+WHERE quota_token\.user_id = \?/i
+				);
+				// The live quota count must bind NORMAL before userId, mirroring
+				// countActiveUserTokens and excluding tokens owned by soft-deleted mailboxes.
+				expect(statements[0].bindings.slice(3, 5)).toEqual([0, 19]);
+				expect(statements[1].sql).toMatch(/RETURNING/);
+				return statements.map(() => ({results: []}));
+			}
+		};
+		const result = await mailboxToolsService.ensureMailboxTokens(
+			{env: {db, jwt_secret: 'unit-test-secret'}, req: {url: 'https://mail.salvadawn.com/api/mailbox-tools/mailboxes/ensure-tokens'}},
+			{accountIds: [707]},
+			19
+		);
+		expect(result).toMatchObject({requestedCount: 1, createdCount: 1, existingCount: 0});
+		expect(result.list[0]).toMatchObject({accountId: 707, email: 'verify@salvadawn.com', created: true});
+		expect(result.list[0].codeUrl).toMatch(/^https:\/\/mail\.salvadawn\.com\/api\/mailbox-tools\/code\//);
+	});
+
+	it('rejects an unowned account id before executing the atomic token batch', async () => {
+		const batch = vi.fn();
+		const db = {
+			prepare(sql) {
+				return {
+					bind(...bindings) {
+						expect(bindings).toHaveLength((sql.match(/\?/g) || []).length);
+						return this;
+					},
+					async all() {
+						return {results: []};
+					}
+				};
+			},
+			batch
+		};
+
+		await expect(mailboxToolsService.ensureMailboxTokens(
+			{env: {db}, req: {url: 'https://mail.salvadawn.com/api/mailbox-tools/mailboxes/ensure-tokens'}},
+			{accountIds: [707]},
+			19
+		)).rejects.toThrow(/不存在或不属于当前用户/);
+		expect(batch).not.toHaveBeenCalled();
+	});
 });
 
 describe('verification-code extraction', () => {
