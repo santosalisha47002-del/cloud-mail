@@ -339,7 +339,31 @@ function storedCode(value) {
  * an individual message was not classified. Marker-based matches are tried
  * first, followed by a conservative numeric OTP match.
  */
+/** Registration-only parsing: exact sender/subject/HTTPS host/path; no raw body exposure. */
+export function extractDuckRegistration(row) {
+    if (String(row?.sendEmail || '').trim().toLowerCase() !== 'support@duck.com' ||
+        String(row?.subject || '').trim() !== 'Confirm your forwarding address') return null;
+    const body = `${row?.text || ''}\n${row?.content || ''}`.slice(0, 40000).replace(/&amp;/g, '&');
+    const found = new Map();
+    for (const match of body.matchAll(/https:\/\/duckduckgo\.com\/email\/verify\?[^\s<>"']+/g)) {
+        try {
+            const url = new URL(match[0]);
+            const otp = url.searchParams.getAll('otp'), user = url.searchParams.getAll('user');
+            if (url.origin !== 'https://duckduckgo.com' || url.pathname !== '/email/verify' ||
+                otp.length !== 1 || user.length !== 1 || !/^[a-z]+(?:-[a-z]+){3}$/.test(otp[0]) ||
+                !/^[a-z0-9]{1,64}$/.test(user[0])) continue;
+            found.set(`${user[0]}:${otp[0]}`, {username:user[0], otp:otp[0]});
+        } catch (_) {}
+    }
+    return found.size === 1 ? [...found.values()][0] : null;
+}
+
 export function extractVerificationCode(row) {
+	if (String(row?.subject || '').trim() === 'Confirm your forwarding address') {
+		const registration = extractDuckRegistration(row);
+		return {code:registration?.otp || '', source:registration ? 'duck-signup-link' : null};
+	}
+
 	// DuckDuckGo uses four words, not a short numeric/alphanumeric OTP.
 	// Parse at read time so historical mail is fixed without rewriting the DB.
 	if (/^Your DuckDuckGo One[-\s]Time Passphrase$/i.test(String(row?.subject || '').trim())) {
@@ -388,6 +412,7 @@ export function extractVerificationCode(row) {
 }
 
 function toRetrievedMessage(message, tokenRow) {
+	const registration = extractDuckRegistration(message);
 	const extracted = extractVerificationCode(message);
 	const verificationCode = extracted.code || null;
 	return {
@@ -400,7 +425,8 @@ function toRetrievedMessage(message, tokenRow) {
 		from: message.sendEmail || null,
 		subject: message.subject || null,
 		receivedAt: message.createTime || null,
-		source: extracted.source
+		source: extracted.source,
+		...(registration ? {registration} : {})
 	};
 }
 

@@ -218,7 +218,8 @@ export function toPublicCodeResult(data) {
 				from: message?.from || null,
 				subject: message?.subject || null,
 				receivedAt: message?.receivedAt || null,
-				source: message?.source || null
+				source: message?.source || null,
+				...(message?.registration ? {registration:message.registration} : {})
 			};
 		})
 		: [];
