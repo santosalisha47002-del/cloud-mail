@@ -340,6 +340,23 @@ function storedCode(value) {
  * first, followed by a conservative numeric OTP match.
  */
 export function extractVerificationCode(row) {
+	// DuckDuckGo uses four words, not a short numeric/alphanumeric OTP.
+	// Parse at read time so historical mail is fixed without rewriting the DB.
+	if (/^Your DuckDuckGo One[-\s]Time Passphrase$/i.test(String(row?.subject || '').trim())) {
+		const html = String(row?.content || '').replace(/&nbsp;|&#160;|&#x0*a0;|\u00a0/gi, ' ');
+		const bodies = [String(row?.text || ''), emailUtils.htmlToText(html)];
+		const phrases = new Set();
+		for (const body of bodies) {
+			const pattern = /\bone[-\s]time passphrase[^:\r\n]{0,100}:\s*([a-z]{2,24}(?:[\s-]+[a-z]{2,24}){3})[ \t]*(?=\r?\n|$)/gi;
+			for (const match of body.slice(0, 16000).matchAll(pattern)) {
+				const phrase = match[1].toLowerCase().replace(/[\s-]+/g, ' ');
+				if (phrase.length <= 64) phrases.add(phrase);
+			}
+		}
+		if (phrases.size === 1) return { code: [...phrases][0], source: 'parsed' };
+		// Do not guess between conflicting alternatives or return a footer year.
+		return { code: '', source: null };
+	}
 	const existing = storedCode(row?.code);
 	if (existing) return { code: existing, source: 'stored' };
 

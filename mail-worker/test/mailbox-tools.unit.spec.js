@@ -344,6 +344,46 @@ describe('mailbox management inventory', () => {
 });
 
 describe('verification-code extraction', () => {
+	const duckSubject = 'Your DuckDuckGo One-Time Passphrase';
+	const duckBody = 'To continue, enter this one-time passphrase in your open DuckDuckGo tab:\n\n';
+	const duckPhrase = 'alpha bravo charlie delta';
+	it.each([
+		duckPhrase,
+		'Alpha-Bravo-Charlie-Delta',
+		'alpha\u00a0bravo\u00a0charlie\u00a0delta',
+		'alpha bravo\ncharlie delta'
+	])('extracts the complete DuckDuckGo phrase: %s', phrase => {
+		expect(extractVerificationCode({ subject: duckSubject, text: duckBody + phrase + '\n\nIf you did not expect this email, ignore it.' }))
+			.toEqual({ code: duckPhrase, source: 'parsed' });
+	});
+	it('supports HTML-only passphrases with nonbreaking-space entities', () => {
+		expect(extractVerificationCode({ subject: duckSubject, content: '<p>' + duckBody + '</p><p>alpha&nbsp;bravo&#160;charlie&#xA0;delta</p><p>If you did not expect this email, ignore it.</p>' }))
+			.toEqual({ code: duckPhrase, source: 'parsed' });
+	});
+	it('deduplicates MIME alternatives and ignores a previously misclassified numeric code', () => {
+		expect(extractVerificationCode({ subject: duckSubject, code: '2026', text: duckBody + duckPhrase, content: '<p>' + duckBody + duckPhrase + '</p>' }))
+			.toEqual({ code: duckPhrase, source: 'parsed' });
+	});
+	it.each([
+		'please read this email',
+		duckBody + 'one two three',
+		duckBody + 'one two three four five',
+		duckBody + '1234 six seven eight',
+		duckBody + duckPhrase + '\n\n' + duckBody + 'apple banana cherry orange'
+	])('rejects missing, malformed or ambiguous passphrases', text => {
+		expect(extractVerificationCode({ subject: duckSubject, text, code: '2026' })).toEqual({ code: '', source: null });
+	});
+	it('does not classify arbitrary four-word English mail as a code', () => {
+		expect(extractVerificationCode({ subject: 'A normal notification', text: duckPhrase })).toEqual({ code: '', source: null });
+	});
+	it('rejects conflicting text/HTML phrases', () => {
+		expect(extractVerificationCode({ subject: duckSubject, text: duckBody + duckPhrase, content: '<p>' + duckBody + 'apple banana cherry orange</p>' })).toEqual({ code: '', source: null });
+	});
+	it('returns the same phrase in both API fields without changing cursor metadata', () => {
+		const result = buildRetrievalResult([{ emailId: 3834, subject: duckSubject, text: duckBody + duckPhrase, sendEmail: 'support@duck.com' }], { email: 'test@example.com', accountId: 42 }, { mode: 'latest' });
+		expect(result).toMatchObject({ found: true, code: duckPhrase, latestEmailId: 3834, nextAfterEmailId: 3834 });
+		expect(result.messages[0]).toMatchObject({ found: true, code: duckPhrase, verificationCode: duckPhrase, emailId: 3834, from: 'support@duck.com' });
+	});
 	it('prefers the code stored by the mail ingestion pipeline', () => {
 		expect(extractVerificationCode({ code: 'A9-42K', subject: '验证码 111111' })).toEqual({
 			code: 'A9-42K',
