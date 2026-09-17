@@ -343,7 +343,7 @@ const en = {
     mailboxApiSubtitle: 'Create random mailboxes in bulk and generate a dedicated URL that reads verification codes',
     receivingReady: 'Receiving service ready',
     batchMailboxTitle: 'Create Random Mailboxes',
-    batchMailboxDesc: 'Generate random addresses with an independent retrieval URL for every mailbox',
+    batchMailboxDesc: 'No total mailbox cap; create up to 50 addresses per request with independent retrieval URLs',
     createCount: 'Number to create',
     mailDomain: 'Email domain',
     selectDomain: 'Select a domain',

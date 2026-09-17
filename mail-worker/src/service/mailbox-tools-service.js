@@ -14,13 +14,9 @@ import { isMailboxCodeCredential } from '../security/mailbox-code-route';
 
 const encoder = new TextEncoder();
 const MAX_BATCH_SIZE = 50;
-const MAX_MAILBOXES_PER_USER = 500;
 const MAX_RANDOM_LENGTH = 32;
 const MAX_ACTIVE_TOKENS_PER_ACCOUNT = 10;
-// Every mailbox created by the automation pool owns one retrieval URL. Keep
-// enough user-level capacity for all 500 mailboxes while retaining the
-// existing per-mailbox limit for manually-created replacement URLs.
-const MAX_ACTIVE_TOKENS_PER_USER = MAX_MAILBOXES_PER_USER * MAX_ACTIVE_TOKENS_PER_ACCOUNT;
+// Mailbox totals are unlimited; request sizes and per-mailbox URLs stay bounded.
 const BATCH_SQL_CHUNK_SIZE = 25;
 const DEFAULT_RETRIEVAL_LIMIT = 20;
 const MAX_RETRIEVAL_LIMIT = 50;
@@ -135,10 +131,6 @@ function isUniqueConstraint(error) {
 	return /unique constraint|constraint failed|sqlite_constraint/i.test(error?.message || '');
 }
 
-function isQuotaGuardConstraint(error) {
-	return /not null constraint failed:\s*account\.email|sqlite_constraint_notnull/i.test(error?.message || '');
-}
-
 function chunks(items, size = BATCH_SQL_CHUNK_SIZE) {
 	const output = [];
 	for (let index = 0; index < items.length; index += size) {
@@ -150,22 +142,6 @@ function chunks(items, size = BATCH_SQL_CHUNK_SIZE) {
 function valuesPlaceholders(rowCount, columnCount) {
 	const row = `(${Array(columnCount).fill('?').join(', ')})`;
 	return Array(rowCount).fill(row).join(', ');
-}
-
-async function countActiveUserTokens(c, userId) {
-	const row = await c.env.db
-		.prepare(`
-			SELECT COUNT(*) AS total
-			FROM mailbox_api_token token
-			INNER JOIN account owned
-				ON owned.account_id = token.account_id
-				AND owned.user_id = token.user_id
-				AND owned.is_del = ?
-			WHERE token.user_id = ? AND token.revoked_at IS NULL
-		`)
-		.bind(isDel.NORMAL, userId)
-		.first();
-	return Number(row?.total || 0);
 }
 
 async function removeIncompleteBatch(c, userId, accountIds) {
@@ -583,26 +559,9 @@ const mailboxToolsService = {
 			throw new BizError('固定前缀包含已禁用内容', 403);
 		}
 
-		// This automation pool intentionally has its own quota. The ordinary
-		// role.accountCount value is designed for interactive account creation
-		// and would make a default batch of ten fail for a user with one mailbox.
-		const [currentCount, activeTokenCount] = await Promise.all([
-			accountService.countUserAccount(c, userId),
-			countActiveUserTokens(c, userId)
-		]);
-		const remainingBeforeCreate = Math.max(0, MAX_MAILBOXES_PER_USER - currentCount);
-		if (countRequested > remainingBeforeCreate) {
-			throw new BizError(`批量邮箱上限为 ${MAX_MAILBOXES_PER_USER} 个，当前仅可创建 ${remainingBeforeCreate} 个`, 403);
-		}
-		const remainingTokenCapacity = Math.max(0, MAX_ACTIVE_TOKENS_PER_USER - activeTokenCount);
-		if (countRequested > remainingTokenCapacity) {
-			throw new BizError(`取件 URL 上限为 ${MAX_ACTIVE_TOKENS_PER_USER} 个，当前仅可创建 ${remainingTokenCapacity} 个`, 403);
-		}
-
-		// D1 executes every statement in a batch as one transaction. Accounts,
-		// their public IDs and the final cardinality assertion therefore commit
-		// together. A quota race, address collision or token collision aborts the
-		// whole batch rather than leaving mailboxes without retrieval URLs.
+		// No cumulative mailbox or retrieval-URL quota for this pool. Each request
+		// remains bounded by MAX_BATCH_SIZE. D1 atomically commits the accounts,
+		// credentials and cardinality assertion, or rolls back all of them.
 		for (let batchAttempt = 0; batchAttempt < 6; batchAttempt++) {
 			const candidates = [];
 			const candidateSet = new Set();
@@ -636,27 +595,6 @@ const mailboxToolsService = {
 			const accountChunks = chunks(tokenCandidates);
 			const tokenChunks = chunks(tokenCandidates);
 			const statements = [];
-
-			// This zero-row guard becomes a deliberate NOT NULL violation only if
-			// another request used account/token capacity after our preflight read.
-			statements.push(c.env.db.prepare(`
-				INSERT INTO account (email, name, user_id)
-				SELECT NULL, '', ?
-				WHERE (
-					SELECT COUNT(*) FROM account WHERE user_id = ? AND is_del = 0
-				) + ? > ?
-				OR (
-					SELECT COUNT(*) FROM mailbox_api_token WHERE user_id = ? AND revoked_at IS NULL
-				) + ? > ?
-			`).bind(
-				userId,
-				userId,
-				countRequested,
-				MAX_MAILBOXES_PER_USER,
-				userId,
-				countRequested,
-				MAX_ACTIVE_TOKENS_PER_USER
-			));
 
 			for (const itemChunk of accountChunks) {
 				const bindings = itemChunk.flatMap(item => [item.address, item.local]);
@@ -726,7 +664,7 @@ const mailboxToolsService = {
 
 			try {
 				const batchResult = await c.env.db.batch(statements);
-				const accountStart = 1;
+				const accountStart = 0;
 				const tokenStart = accountStart + accountChunks.length;
 				const createdAccounts = batchResult
 					.slice(accountStart, tokenStart)
@@ -763,16 +701,14 @@ const mailboxToolsService = {
 					requested: countRequested,
 					createdCount: created.length,
 					quota: {
-						limit: MAX_MAILBOXES_PER_USER,
+						limit: null,
+						unlimited: true,
 						used,
-						remaining: Math.max(0, MAX_MAILBOXES_PER_USER - used)
+						remaining: null
 					}
 				};
 			} catch (error) {
 				if (error?.name === 'BizError') throw error;
-				if (isQuotaGuardConstraint(error)) {
-					throw new BizError('批量邮箱或取件 URL 配额已被并发请求占用，请重试', 409);
-				}
 				if (!isUniqueConstraint(error) || batchAttempt === 5) throw error;
 			}
 		}
@@ -979,8 +915,8 @@ const mailboxToolsService = {
 
 	/**
 	 * Idempotently create one default retrieval credential for every requested
-	 * owned mailbox that currently has none. The D1 batch contains a live quota
-	 * guard and the INSERT re-checks ownership/token existence in the same
+	 * owned mailbox that currently has none. The INSERT re-checks
+	 * ownership/token existence in the same
 	 * transaction, so retries and concurrent clicks cannot create duplicates.
 	 */
 	async ensureMailboxTokens(c, params, userId) {
@@ -1003,54 +939,11 @@ const mailboxToolsService = {
 		const existingAccountIds = new Set(activeRows.map(row => Number(row.accountId)));
 		const missingRows = ownedRows.filter(row => !existingAccountIds.has(row.accountId));
 		if (missingRows.length) {
-			const activeCount = await countActiveUserTokens(c, userId);
-			if (activeCount + missingRows.length > MAX_ACTIVE_TOKENS_PER_USER) {
-				throw new BizError(`每个用户最多保留 ${MAX_ACTIVE_TOKENS_PER_USER} 个有效取件 URL`, 403);
-			}
-
 			const candidates = missingRows.map(row => ({
 				...row,
 				publicId: crypto.randomUUID()
 			}));
-			const guardValues = candidates.map(() => '(?)').join(', ');
 			const insertValues = candidates.map(() => '(?, ?)').join(', ');
-			const guard = c.env.db.prepare(`
-				WITH candidates(account_id) AS (VALUES ${guardValues})
-				INSERT INTO mailbox_api_token (public_id, user_id, account_id, label)
-				SELECT NULL, ?, 0, ?
-				WHERE (
-					SELECT COUNT(*)
-					FROM mailbox_api_token quota_token
-					INNER JOIN account quota_account
-						ON quota_account.account_id = quota_token.account_id
-						AND quota_account.user_id = quota_token.user_id
-						AND quota_account.is_del = ?
-					WHERE quota_token.user_id = ? AND quota_token.revoked_at IS NULL
-				) + (
-					SELECT COUNT(*)
-					FROM candidates candidate
-					INNER JOIN account owned
-						ON owned.account_id = candidate.account_id
-						AND owned.user_id = ?
-						AND owned.is_del = ?
-					WHERE NOT EXISTS (
-						SELECT 1 FROM mailbox_api_token active
-						WHERE active.user_id = ?
-							AND active.account_id = candidate.account_id
-							AND active.revoked_at IS NULL
-					)
-				) > ?
-			`).bind(
-				...candidates.map(row => row.accountId),
-				userId,
-				MANAGED_TOKEN_LABEL,
-				isDel.NORMAL,
-				userId,
-				userId,
-				isDel.NORMAL,
-				userId,
-				MAX_ACTIVE_TOKENS_PER_USER
-			);
 			const insert = c.env.db.prepare(`
 				WITH candidates(account_id, public_id) AS (VALUES ${insertValues})
 				INSERT INTO mailbox_api_token (public_id, user_id, account_id, label)
@@ -1082,14 +975,7 @@ const mailboxToolsService = {
 				userId
 			);
 
-			try {
-				await c.env.db.batch([guard, insert]);
-			} catch (error) {
-				if (/not null constraint failed:\s*mailbox_api_token\.public_id|sqlite_constraint_notnull/i.test(error?.message || '')) {
-					throw new BizError('取件 URL 配额已被并发请求占用，请重试', 409);
-				}
-				throw error;
-			}
+			await c.env.db.batch([insert]);
 			activeRows = await this.selectActiveTokensForAccounts(c, userId, accountIds);
 		}
 
@@ -1274,17 +1160,11 @@ const mailboxToolsService = {
 		)).get();
 		if (!accountRow) throw new BizError('邮箱不存在或不属于当前用户', 404);
 
-		const [userTokenCount, accountTokenCount] = await Promise.all([
-			countActiveUserTokens(c, userId),
-			orm(c).select({ total: count() }).from(mailboxApiToken).where(and(
-				eq(mailboxApiToken.userId, userId),
-				eq(mailboxApiToken.accountId, accountId),
-				isNull(mailboxApiToken.revokedAt)
-			)).get()
-		]);
-		if (Number(userTokenCount) >= MAX_ACTIVE_TOKENS_PER_USER) {
-			throw new BizError(`每个用户最多保留 ${MAX_ACTIVE_TOKENS_PER_USER} 个有效取件 URL`, 403);
-		}
+		const accountTokenCount = await orm(c).select({ total: count() }).from(mailboxApiToken).where(and(
+			eq(mailboxApiToken.userId, userId),
+			eq(mailboxApiToken.accountId, accountId),
+			isNull(mailboxApiToken.revokedAt)
+		)).get();
 		if (Number(accountTokenCount.total) >= MAX_ACTIVE_TOKENS_PER_ACCOUNT) {
 			throw new BizError(`每个邮箱最多保留 ${MAX_ACTIVE_TOKENS_PER_ACCOUNT} 个有效取件 URL`, 403);
 		}

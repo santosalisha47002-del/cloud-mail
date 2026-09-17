@@ -31,8 +31,7 @@ describe('batch mailbox retrieval credentials', () => {
 		vi.spyOn(settingService, 'query').mockResolvedValue({ minEmailPrefix: 1, emailPrefixFilter: [] });
 		vi.spyOn(roleService, 'selectById').mockResolvedValue({});
 		vi.spyOn(accountService, 'countUserAccount')
-			.mockResolvedValueOnce(1)
-			.mockResolvedValueOnce(3);
+			.mockResolvedValue(502);
 
 		const batches = [];
 		const db = {
@@ -103,8 +102,9 @@ describe('batch mailbox retrieval credentials', () => {
 			expect(item.tokenId).toBeGreaterThan(0);
 		}
 		expect(batches).toHaveLength(1);
-		expect(batches[0]).toHaveLength(4);
-		expect(batches[0][0].sql).toMatch(/COUNT\(\*\).*mailbox_api_token/is);
+		expect(batches[0]).toHaveLength(3);
+		expect(result.quota).toEqual({limit: null, unlimited: true, used: 502, remaining: null});
+		expect(batches[0][0].sql).toMatch(/WITH candidates\(email, name\)/i);
 		expect(batches[0].at(-1).sql).toMatch(/public_id IN/is);
 	});
 });
@@ -295,15 +295,10 @@ describe('mailbox management inventory', () => {
 				return statement;
 			},
 			async batch(statements) {
-				expect(statements).toHaveLength(2);
-				expect(statements[0].sql).toMatch(/SELECT NULL/);
-				expect(statements[0].sql).toMatch(
-					/FROM mailbox_api_token quota_token[\s\S]+INNER JOIN account quota_account[\s\S]+quota_account\.is_del = \?[\s\S]+WHERE quota_token\.user_id = \?/i
-				);
-				// The live quota count must bind NORMAL before userId, mirroring
-				// countActiveUserTokens and excluding tokens owned by soft-deleted mailboxes.
-				expect(statements[0].bindings.slice(3, 5)).toEqual([0, 19]);
-				expect(statements[1].sql).toMatch(/RETURNING/);
+				expect(statements).toHaveLength(1);
+				expect(statements[0].sql).toMatch(/RETURNING/);
+				expect(statements[0].sql).toMatch(/NOT EXISTS/);
+				expect(statements[0].sql).not.toMatch(/SELECT NULL|quota_token/);
 				return statements.map(() => ({results: []}));
 			}
 		};

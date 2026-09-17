@@ -343,7 +343,7 @@ defineOptions({name: 'mailbox-management'})
 
 const translations = {
   zh: {
-    title: '邮箱管理', subtitle: '集中查看所有邮箱、取件 API 和历史邮件，批量管理更轻松', refresh: '刷新',
+    title: '邮箱管理', subtitle: '邮箱总量不设上限，集中管理所有邮箱、取件 API 和历史邮件', refresh: '刷新',
     allMailboxes: '全部邮箱', apiReadyTotal: '已有取件 API', apiMissingTotal: '缺少取件 API', allMessages: '累计收到邮件',
     inventory: '所有邮箱', inventoryDesc: '筛选、选择并导出邮箱和专属取件 URL', selectAllFiltered: '选择全部筛选结果',
     clearSelection: '清空选择', searchPlaceholder: '搜索邮箱、备注或 Account ID', allDomains: '全部域名',
@@ -362,7 +362,7 @@ const translations = {
     exportDone: '已导出 {count} 个邮箱', apiStillMissing: '有 {count} 个邮箱暂时没有取件 API', loadFailed: '加载失败，请重试'
   },
   en: {
-    title: 'Mailbox Management', subtitle: 'Manage every mailbox, retrieval API, and message history in one place', refresh: 'Refresh',
+    title: 'Mailbox Management', subtitle: 'No total mailbox cap. Manage mailboxes, retrieval APIs, and message history in one place', refresh: 'Refresh',
     allMailboxes: 'All mailboxes', apiReadyTotal: 'Retrieval APIs ready', apiMissingTotal: 'Retrieval APIs missing', allMessages: 'Messages received',
     inventory: 'All Mailboxes', inventoryDesc: 'Filter, select, and export addresses with their private retrieval URLs', selectAllFiltered: 'Select all filtered',
     clearSelection: 'Clear selection', searchPlaceholder: 'Search email, label, or Account ID', allDomains: 'All domains',

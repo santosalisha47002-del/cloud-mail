@@ -343,7 +343,7 @@ const zh = {
     mailboxApiSubtitle: '批量创建随机邮箱，并为任意现有邮箱生成可直接读取验证码的专属 URL',
     receivingReady: '收件服务已就绪',
     batchMailboxTitle: '批量创建随机邮箱',
-    batchMailboxDesc: '一次生成多个随机地址，并为每个地址自动创建独立取件 URL',
+    batchMailboxDesc: '邮箱总量不设上限；单次最多生成 50 个地址，并自动创建独立取件 URL',
     createCount: '创建数量',
     mailDomain: '邮箱域名',
     selectDomain: '请选择域名',
